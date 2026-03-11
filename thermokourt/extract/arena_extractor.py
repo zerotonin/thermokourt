@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
  ╔═══════════════════════════════════════════════════════════════════════╗
- ║  ░█▀█░█▀▄░█▀▀░█▀█░█▀█░░░█▀▀░█░█░▀█▀░█▀▄░█▀█░█▀▀░▀█▀░█▀█░█▀▄░░         ║
- ║  ░█▀█░█▀▄░█▀▀░█░█░█▀█░░░█▀▀░▄▀▄░░█░░█▀▄░█▀█░█░░░░█░░█░█░█▀▄░░         ║
- ║  ░▀░▀░▀░▀░▀▀▀░▀░▀░▀░▀░░░▀▀▀░▀░▀░░▀░░▀░▀░▀░▀░▀▀▀░░▀░░▀▀▀░▀░▀░░         ║
- ║                                                                       ║
- ║   Detect, verify & extract circular arenas from Motif recordings      ║
- ║   ── detect. adjust. stitch. crop. science. ──                v1.1    ║
+ ║  ░█▀█░█▀▄░█▀▀░█▀█░█▀█░░░█▀▀░█░█░▀█▀░█▀▄░█▀█░█▀▀░▀█▀░█▀█░█▀▄░░   ║
+ ║  ░█▀█░█▀▄░█▀▀░█░█░█▀█░░░█▀▀░▄▀▄░░█░░█▀▄░█▀█░█░░░░█░░█░█░█▀▄░░   ║
+ ║  ░▀░▀░▀░▀░▀▀▀░▀░▀░▀░▀░░░▀▀▀░▀░▀░░▀░░▀░▀░▀░▀░▀▀▀░░▀░░▀▀▀░▀░▀░░   ║
+ ║                                                                      ║
+ ║   Detect, verify & extract circular arenas from Motif recordings     ║
+ ║   ── detect. adjust. stitch. crop. science. ──                v1.1   ║
  ╚═══════════════════════════════════════════════════════════════════════╝
 
 Pipeline for Drosophila arena recordings captured with Motif (FLIR/Basler).
@@ -171,11 +171,20 @@ def get_mp4_chunks(recording_dir: str) -> List[str]:
     return chunks
 
 
-def extract_first_frame(mp4_path: str) -> np.ndarray:
-    """Extract first frame via ffmpeg. Returns RGB (H, W, 3) uint8."""
+def extract_frame(mp4_path: str, which: str = "last") -> np.ndarray:
+    """Extract a frame from an mp4 file using ffmpeg.
+
+    Args:
+        mp4_path: Path to the video file.
+        which: 'first' or 'last'. Default 'last' because the first frame
+               often has separator walls still in the arenas.
+
+    Returns:
+        RGB numpy array (H, W, 3) uint8.
+    """
     probe_cmd = [
         "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_streams", mp4_path,
+        "-show_streams", "-show_format", mp4_path,
     ]
     probe = subprocess.run(probe_cmd, capture_output=True, text=True)
     if probe.returncode != 0:
@@ -183,15 +192,45 @@ def extract_first_frame(mp4_path: str) -> np.ndarray:
     info = json.loads(probe.stdout)
     vstream = next(s for s in info["streams"] if s["codec_type"] == "video")
     w, h = int(vstream["width"]), int(vstream["height"])
-    cmd = [
-        "ffmpeg", "-i", mp4_path, "-frames:v", "1",
-        "-f", "image2pipe", "-pix_fmt", "rgb24",
-        "-vcodec", "rawvideo", "-loglevel", "error", "-"
-    ]
+
+    if which == "last":
+        # Get duration, seek near end, take last frame
+        duration = float(info.get("format", {}).get("duration", 0))
+        if duration <= 0:
+            # Try stream-level duration
+            duration = float(vstream.get("duration", 0))
+        # Seek to 1 second before the end (or 0 if very short)
+        seek_time = max(0, duration - 1.0)
+        cmd = [
+            "ffmpeg",
+            "-ss", f"{seek_time:.3f}",
+            "-i", mp4_path,
+            "-update", "1",  # keep overwriting so we get the last frame
+            "-f", "image2pipe", "-pix_fmt", "rgb24",
+            "-vcodec", "rawvideo", "-loglevel", "error", "-"
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-i", mp4_path, "-frames:v", "1",
+            "-f", "image2pipe", "-pix_fmt", "rgb24",
+            "-vcodec", "rawvideo", "-loglevel", "error", "-"
+        ]
+
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {result.stderr.decode()}")
-    return np.frombuffer(result.stdout, dtype=np.uint8).reshape((h, w, 3))
+
+    raw = result.stdout
+    frame_size = h * w * 3
+    if len(raw) < frame_size:
+        raise RuntimeError(
+            f"Not enough data for frame: got {len(raw)} bytes, need {frame_size}"
+        )
+    # Take the LAST complete frame from the output (for 'last' mode,
+    # ffmpeg may output multiple frames from the seek point)
+    n_frames = len(raw) // frame_size
+    offset = (n_frames - 1) * frame_size
+    return np.frombuffer(raw[offset:offset + frame_size], dtype=np.uint8).reshape((h, w, 3))
 
 
 # ┌─────────────────────────────────────────────────────────────────────┐
@@ -356,7 +395,7 @@ class MultiCircleEditor:
     """Interactive matplotlib GUI for editing multiple circular arenas.
 
     Controls:
-      Drag centre (+)       Move arena
+      Drag centre (o)       Move arena
       Drag rim handle (diamond)  Resize arena
       Right-click empty     Add new arena
       Right-click centre    Delete arena
@@ -378,7 +417,6 @@ class MultiCircleEditor:
         self.show_fill = True
         self.show_help = False
         self.accepted = False
-        self._background = None
         self._overlay_artists = []
 
         h, w = frame.shape[:2]
@@ -389,6 +427,7 @@ class MultiCircleEditor:
         self.fig.canvas.manager.set_window_title(self.WINDOW_NAME)
         self.fig.subplots_adjust(left=0.01, right=0.99, top=0.94, bottom=0.01)
 
+        # Display background image ONCE — never cleared
         if len(frame.shape) == 2:
             self.ax.imshow(frame, cmap="gray", aspect="equal")
         else:
@@ -401,20 +440,16 @@ class MultiCircleEditor:
         self.fig.canvas.mpl_connect("button_release_event", self._on_release)
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
-        self.fig.canvas.mpl_connect("draw_event", self._on_draw)
 
-        self._render_overlay()
-        self.fig.canvas.draw()
+        self._draw_overlay()
         plt.show()
 
     @staticmethod
     def _colour(idx):
         return COLOURS[idx % len(COLOURS)]
 
-    def _on_draw(self, event):
-        self._background = self.fig.canvas.copy_from_bbox(self.ax.bbox)
-
     def _clear_overlay(self):
+        """Remove all overlay artists without touching the background image."""
         for a in self._overlay_artists:
             try:
                 a.remove()
@@ -422,54 +457,58 @@ class MultiCircleEditor:
                 pass
         self._overlay_artists.clear()
 
-    def _render_overlay(self):
+    def _draw_overlay(self):
+        """Remove old overlay, draw new overlay, refresh display."""
         self._clear_overlay()
         h, w = self.frame.shape[:2]
         self.arenas = sort_arenas_row_major(self.arenas)
 
         for a in self.arenas:
             col = self._colour(a.idx)
+
+            # Circle
             cp = MplCircle(
                 (a.cx, a.cy), a.r,
                 fill=self.show_fill,
                 facecolor=col if self.show_fill else "none",
                 edgecolor=col,
                 alpha=FILL_ALPHA if self.show_fill else EDGE_ALPHA,
-                linewidth=2, animated=True,
+                linewidth=2,
             )
             self.ax.add_patch(cp)
             self._overlay_artists.append(cp)
 
+            # Bounding box (padded crop region)
             bx, by, bw, bh = a.bbox(padding=CROP_PADDING, frame_w=w, frame_h=h)
             rect = MplRect(
                 (bx, by), bw, bh, fill=False, edgecolor=col,
-                linewidth=1, linestyle="--", alpha=0.5, animated=True,
+                linewidth=1, linestyle="--", alpha=0.5,
             )
             self.ax.add_patch(rect)
             self._overlay_artists.append(rect)
 
+            # Centre marker — use 'o' marker to avoid edgecolor warning with '+'
             sc = self.ax.scatter(
                 [a.cx], [a.cy], s=CENTRE_SIZE, c=[col],
-                edgecolors="white", linewidth=1.5, zorder=5,
-                marker="+", animated=True,
+                edgecolors=[col], linewidth=1.5, zorder=5, marker="o",
             )
             self._overlay_artists.append(sc)
 
-            rim_x = a.cx + a.r
+            # Rim handle at 3-o'clock
             sr = self.ax.scatter(
-                [rim_x], [a.cy], s=RIM_HANDLE_SIZE, c=[col],
-                edgecolors="white", linewidth=1.5, zorder=6,
-                marker="D", animated=True,
+                [a.cx + a.r], [a.cy], s=RIM_HANDLE_SIZE, c=[col],
+                edgecolors="white", linewidth=1.5, zorder=6, marker="D",
             )
             self._overlay_artists.append(sr)
 
+            # Label
             if self.show_labels:
                 txt = self.ax.annotate(
                     f"#{a.idx:02d}", (a.cx, a.cy - a.r - 8),
                     fontsize=LABEL_FONTSIZE, fontweight="bold",
                     color="white", ha="center", va="bottom",
                     bbox=dict(boxstyle="round,pad=0.25", facecolor=col, alpha=0.85),
-                    zorder=7, animated=True,
+                    zorder=7,
                 )
                 self._overlay_artists.append(txt)
 
@@ -478,7 +517,7 @@ class MultiCircleEditor:
                 0.02, 0.98,
                 "=== ARENA EXTRACTOR HELP ===\n\n"
                 "MOUSE\n"
-                "  Drag centre (+)      Move arena\n"
+                "  Drag centre (o)      Move arena\n"
                 "  Drag rim handle      Resize arena\n"
                 "  Right-click empty    Add new arena\n"
                 "  Right-click centre   Delete arena\n\n"
@@ -490,7 +529,7 @@ class MultiCircleEditor:
                 f"Arenas: {len(self.arenas)}   Frame: {w} x {h} px",
                 transform=self.ax.transAxes, fontsize=10,
                 fontfamily="monospace", verticalalignment="top",
-                color="white", zorder=10, animated=True,
+                color="white", zorder=10,
                 bbox=dict(boxstyle="round,pad=0.8", facecolor="black",
                           alpha=0.88, edgecolor="#00ff88", linewidth=1.5),
             )
@@ -499,20 +538,7 @@ class MultiCircleEditor:
         status = (f"{self.recording_name}  |  {len(self.arenas)} arenas  |  "
                   f"drag=move/resize  right-click=add/delete  Q=accept")
         self.ax.set_title(status, fontsize=9, loc="left", pad=6)
-
-    def _blit_overlay(self):
-        if self._background is None:
-            self._render_overlay()
-            self.fig.canvas.draw()
-            return
-        self.fig.canvas.restore_region(self._background)
-        for a in self._overlay_artists:
-            self.ax.draw_artist(a)
-        self.fig.canvas.blit(self.ax.bbox)
-
-    def _full_redraw(self):
-        self._render_overlay()
-        self.fig.canvas.draw()
+        self.fig.canvas.draw_idle()
 
     def _hit_test(self, event):
         if event.xdata is None:
@@ -540,17 +566,17 @@ class MultiCircleEditor:
             arena, mode = self._hit_test(event)
             if arena and mode == "move":
                 self.arenas.remove(arena)
-                self._full_redraw()
+                self._draw_overlay()
             else:
                 mr = float(np.median([a.r for a in self.arenas])) if self.arenas else 100.0
                 self.arenas.append(Arena(cx=event.xdata, cy=event.ydata, r=mr))
-                self._full_redraw()
+                self._draw_overlay()
 
     def _on_release(self, event):
         if self._dragging is not None:
             self._dragging = None
             self._drag_mode = ""
-            self._full_redraw()
+            self._draw_overlay()
 
     def _on_motion(self, event):
         if event.inaxes != self.ax or event.xdata is None:
@@ -563,8 +589,7 @@ class MultiCircleEditor:
                 a.cy = float(np.clip(event.ydata - self._drag_offset[1], 0, h))
             elif self._drag_mode == "resize":
                 a.r = max(20.0, float(np.hypot(event.xdata - a.cx, event.ydata - a.cy)))
-            self._render_overlay()
-            self._blit_overlay()
+            self._draw_overlay()
 
     def _on_key(self, event):
         key = event.key
@@ -577,27 +602,27 @@ class MultiCircleEditor:
         elif key == "a":
             self.arenas = detect_arenas(self.frame)
             print(f"[arena_extractor] Re-detected {len(self.arenas)} arenas")
-            self._full_redraw()
+            self._draw_overlay()
         elif key in ("+", "="):
             for a in self.arenas: a.r += 5
-            self._full_redraw()
+            self._draw_overlay()
         elif key == "-":
             for a in self.arenas: a.r = max(20, a.r - 5)
-            self._full_redraw()
+            self._draw_overlay()
         elif key == "u":
             if self.arenas:
                 mr = float(np.median([a.r for a in self.arenas]))
                 for a in self.arenas: a.r = mr
-                self._full_redraw()
+                self._draw_overlay()
         elif key == "l":
             self.show_labels = not self.show_labels
-            self._full_redraw()
+            self._draw_overlay()
         elif key == "f":
             self.show_fill = not self.show_fill
-            self._full_redraw()
+            self._draw_overlay()
         elif key == "h":
             self.show_help = not self.show_help
-            self._full_redraw()
+            self._draw_overlay()
         elif key == "s":
             self._save_json()
 
@@ -702,6 +727,9 @@ def parse_args():
                    help=f"Fractional padding around arena (default: {CROP_PADDING}).")
     p.add_argument("--keep_full", action="store_true")
     p.add_argument("--no_gui", action="store_true")
+    p.add_argument("--frame", choices=["first", "last"], default="last",
+                   help="Which frame to use for detection (default: last, "
+                        "avoids separator walls visible in first frames).")
     return p.parse_args()
 
 
@@ -737,11 +765,11 @@ def main():
     if args.arenas:
         arenas = load_arenas_json(args.arenas)
         print(f"  Loaded {len(arenas)} arenas from {args.arenas}")
-        frame = extract_first_frame(chunks[0])
+        frame = extract_frame(chunks[0], which=args.frame)
         frame_h, frame_w = frame.shape[:2]
     else:
-        print("  Extracting first frame...")
-        frame = extract_first_frame(chunks[0])
+        print(f"  Extracting {args.frame} frame from first chunk...")
+        frame = extract_frame(chunks[0], which=args.frame)
         frame_h, frame_w = frame.shape[:2]
         print(f"  Frame size: {frame_w} x {frame_h}")
         print(f"  Running circle detection (expecting ~{args.n_arenas})...")
