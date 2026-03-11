@@ -1,0 +1,52 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "ThermoKourt: a modular pipeline for analysing Drosophila courtship and aggression under thermal manipulation"
+type: software
+version: "0.1.0"
+date-released: "2026-03-11"
+license: GPL-3.0-or-later
+url: "https://github.com/zerotonin/thermokourt"
+repository-code: "https://github.com/zerotonin/thermokourt"
+authors:
+  - family-names: Geurten
+    given-names: "Bart R.H."
+    orcid: "https://orcid.org/0000-0002-3947-1653"
+    affiliation: "Department of Zoology, University of Otago, Dunedin, New Zealand"
+keywords:
+  - Drosophila
+  - courtship
+  - aggression
+  - ethogram
+  - temperature
+  - thermal manipulation
+  - behavioural neuroscience
+  - animal tracking
+  - computer vision
+  - video processing
+  - arena detection
+  - identity tracking
+  - automated behaviour classification
+abstract: >-
+  ThermoKourt is a modular Python pipeline for analysing
+  Drosophila melanogaster courtship and aggression behaviour
+  under controlled thermal conditions. It covers the full
+  workflow from raw multi-chunk video recordings through
+  arena detection, identity tracking, manual ethogram
+  annotation, and automated behavioural classification.
+  Designed for experiments with two males and one headless
+  female per circular arena at temperatures from 18–32 °C.
+references:
+  - type: software
+    title: "idtracker.ai"
+    authors:
+      - family-names: Romero-Ferrero
+        given-names: Francisco
+    doi: "10.1038/s41592-018-0295-5"
+  - type: software
+    title: "GameThogram"
+    authors:
+      - family-names: Geurten
+        given-names: "Bart R.H."
+      - family-names: Kuhlemann
+        given-names: Ilyas
+    url: "https://github.com/zerotonin/GameThogram"
