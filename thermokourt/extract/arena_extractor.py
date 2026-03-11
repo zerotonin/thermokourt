@@ -1,35 +1,26 @@
 #!/usr/bin/env python3
 """
  ╔═══════════════════════════════════════════════════════════════════════╗
- ║  ░█▀█░█▀▄░█▀▀░█▀█░█▀█░░░█▀▀░█░█░▀█▀░█▀▄░█▀█░█▀▀░▀█▀░█▀█░█▀▄░░   ║
- ║  ░█▀█░█▀▄░█▀▀░█░█░█▀█░░░█▀▀░▄▀▄░░█░░█▀▄░█▀█░█░░░░█░░█░█░█▀▄░░   ║
- ║  ░▀░▀░▀░▀░▀▀▀░▀░▀░▀░▀░░░▀▀▀░▀░▀░░▀░░▀░▀░▀░▀░▀▀▀░░▀░░▀▀▀░▀░▀░░   ║
- ║                                                                      ║
+ ║   Arena Extractor v1.2                                               ║
  ║   Detect, verify & extract circular arenas from Motif recordings     ║
- ║   ── detect. adjust. stitch. crop. science. ──                v1.1   ║
+ ║   ── detect. adjust. stitch. crop. science. ──                       ║
  ╚═══════════════════════════════════════════════════════════════════════╝
 
-Pipeline for Drosophila arena recordings captured with Motif (FLIR/Basler).
-Given a recording directory of sequential .mp4 chunks + metadata.yaml:
+Pipeline for Drosophila arena recordings (Motif / FLIR / Basler).
 
-  1. Reads the first frame of the first chunk
-  2. Auto-detects circular arenas via adaptive thresholding + contour fitting
-  3. Opens an interactive matplotlib GUI for verification
-  4. Concatenates all mp4 chunks via ffmpeg
-  5. Crops each arena (with 10% padding) into individual videos
-
-Usage:
-    python arena_extractor.py /path/to/droso_18deg_20251002_102448
-    python arena_extractor.py /path/to/recording --output_dir /path/to/output
-    python arena_extractor.py /path/to/recording --arenas arenas.json
-    python arena_extractor.py /path/to/recording --n_arenas 8
+  1. Builds a max-projection image (100 frames, 25-100% of duration)
+     to erase dark fly bodies and reveal clean arena boundaries
+  2. Detects circles via Hough transform on the max-projection
+  3. Opens a fast OpenCV GUI for verification / adjustment
+  4. Concatenates .mp4 chunks via ffmpeg concat demuxer
+  5. Crops each arena with 10% padding + white corner masks
+     (5% triangles to hide neighbouring arenas from the tracker)
 
 Requirements:
-    pip install matplotlib numpy Pillow pyyaml opencv-python
-    ffmpeg must be on PATH
+    pip install numpy opencv-python pyyaml
+    ffmpeg on PATH
 
-License: MIT
-Author: Bart R.H. Geurten
+License: MIT · Author: Bart R.H. Geurten
 """
 
 import argparse
@@ -37,51 +28,34 @@ import glob
 import json
 import math
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
-import matplotlib
-import matplotlib.pyplot as plt
+import cv2
 import numpy as np
-from matplotlib.patches import Circle as MplCircle, Rectangle as MplRect
-from PIL import Image
-
-try:
-    matplotlib.rcParams["toolbar"] = "None"
-except TypeError:
-    pass
 
 # ┌─────────────────────────────────────────────────────────────────────┐
-# │  CONSTANTS                                   « system defaults »    │
+# │  CONSTANTS                                                          │
 # └─────────────────────────────────────────────────────────────────────┘
-PICK_RADIUS_PX = 18
-CENTRE_SIZE = 90
-RIM_HANDLE_SIZE = 60
-COLOURS = [
-    "#00ff88", "#ff4466", "#44aaff", "#ffaa00", "#aa44ff",
-    "#ff66cc", "#00ddcc", "#ffdd44", "#88ff44", "#ff8844",
-]
-EDGE_ALPHA = 0.9
-FILL_ALPHA = 0.18
-LABEL_FONTSIZE = 10
 DEFAULT_N_ARENAS = 10
-CROP_PADDING = 0.10
-RADIUS_TOLERANCE = 0.25
+CROP_PADDING = 0.10       # 10 % padding around arena circle
+CORNER_MASK = 0.05        # 5 % of crop side length for corner triangles
+RADIUS_TOLERANCE = 0.25   # reject circles with radius ± 25 % of median
 MIN_ARENAS_FOR_FILTER = 5
+N_PROJECTION_FRAMES = 100 # frames sampled for max-projection
+PROJECTION_START = 0.25   # start at 25 % of total duration
 
 
 # ┌─────────────────────────────────────────────────────────────────────┐
-# │  ARENA DATA                                   « circle geometry »   │
+# │  ARENA DATACLASS                                                    │
 # └─────────────────────────────────────────────────────────────────────┘
 @dataclass
 class Arena:
-    """A circular arena: centre (cx, cy) and radius r in pixel coordinates."""
     cx: float
     cy: float
     r: float
@@ -89,580 +63,473 @@ class Arena:
 
     def bbox(self, padding: float = CROP_PADDING,
              frame_w: int = 0, frame_h: int = 0) -> Tuple[int, int, int, int]:
-        """Return (x, y, w, h) bounding box with padding, clamped to frame."""
-        padded_r = self.r * (1.0 + padding)
-        x = int(self.cx - padded_r)
-        y = int(self.cy - padded_r)
-        w = int(2 * padded_r)
-        h = int(2 * padded_r)
-        if x < 0:
-            w += x
-            x = 0
-        if y < 0:
-            h += y
-            y = 0
-        if frame_w > 0 and x + w > frame_w:
-            w = frame_w - x
-        if frame_h > 0 and y + h > frame_h:
-            h = frame_h - y
-        w = max(2, w - (w % 2))
-        h = max(2, h - (h % 2))
-        return x, y, w, h
+        """(x, y, w, h) with padding, clamped to frame, even dimensions."""
+        pr = self.r * (1.0 + padding)
+        x, y = int(self.cx - pr), int(self.cy - pr)
+        w = h = int(2 * pr)
+        if x < 0: w += x; x = 0
+        if y < 0: h += y; y = 0
+        if frame_w > 0 and x + w > frame_w: w = frame_w - x
+        if frame_h > 0 and y + h > frame_h: h = frame_h - y
+        return x, y, max(2, w - w % 2), max(2, h - h % 2)
 
-    def to_dict(self) -> dict:
+    def to_dict(self):
         return {"cx": self.cx, "cy": self.cy, "r": self.r, "idx": self.idx}
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Arena":
+    def from_dict(cls, d):
         return cls(cx=d["cx"], cy=d["cy"], r=d["r"], idx=d.get("idx", 0))
 
 
 def sort_arenas_row_major(arenas: List[Arena]) -> List[Arena]:
-    """Sort top-to-bottom, left-to-right. Always re-numbers from 0."""
+    """Sort top→bottom, left→right. Re-numbers 0..N-1."""
     if not arenas:
         return arenas
-    arenas_copy = list(arenas)
-    arenas_copy.sort(key=lambda a: a.cy)
-    median_r = float(np.median([a.r for a in arenas_copy]))
-    rows: List[List[Arena]] = []
-    current_row: List[Arena] = [arenas_copy[0]]
-    for a in arenas_copy[1:]:
-        if abs(a.cy - current_row[-1].cy) > median_r:
-            rows.append(current_row)
-            current_row = [a]
+    arenas = sorted(arenas, key=lambda a: a.cy)
+    med_r = float(np.median([a.r for a in arenas]))
+    rows, cur = [], [arenas[0]]
+    for a in arenas[1:]:
+        if abs(a.cy - cur[-1].cy) > med_r:
+            rows.append(cur); cur = [a]
         else:
-            current_row.append(a)
-    rows.append(current_row)
-    sorted_arenas: List[Arena] = []
-    idx = 0
+            cur.append(a)
+    rows.append(cur)
+    out, idx = [], 0
     for row in rows:
-        row.sort(key=lambda a: a.cx)
-        for a in row:
-            a.idx = idx
-            sorted_arenas.append(a)
-            idx += 1
-    return sorted_arenas
+        for a in sorted(row, key=lambda a: a.cx):
+            a.idx = idx; out.append(a); idx += 1
+    return out
 
 
-def filter_by_radius(arenas: List[Arena],
-                     tolerance: float = RADIUS_TOLERANCE,
-                     min_keep: int = MIN_ARENAS_FOR_FILTER) -> List[Arena]:
-    """Remove arenas with radius outside ±tolerance of median.
-    Skips filtering if result would have fewer than min_keep arenas."""
+def filter_by_radius(arenas, tol=RADIUS_TOLERANCE, keep=MIN_ARENAS_FOR_FILTER):
     if len(arenas) < 3:
         return sort_arenas_row_major(arenas)
-    radii = [a.r for a in arenas]
-    median_r = float(np.median(radii))
-    lo = median_r * (1.0 - tolerance)
-    hi = median_r * (1.0 + tolerance)
-    filtered = [a for a in arenas if lo <= a.r <= hi]
-    if len(filtered) < min_keep:
-        return sort_arenas_row_major(arenas)
-    return sort_arenas_row_major(filtered)
+    med = float(np.median([a.r for a in arenas]))
+    f = [a for a in arenas if med * (1 - tol) <= a.r <= med * (1 + tol)]
+    return sort_arenas_row_major(f if len(f) >= keep else arenas)
 
 
 # ┌─────────────────────────────────────────────────────────────────────┐
-# │  FRAME EXTRACTION                                                   │
+# │  VIDEO I/O helpers                                                  │
 # └─────────────────────────────────────────────────────────────────────┘
-def get_mp4_chunks(recording_dir: str) -> List[str]:
-    chunks = sorted(glob.glob(os.path.join(recording_dir, "*.mp4")))
-    if not chunks:
-        raise FileNotFoundError(f"No .mp4 files found in {recording_dir}")
-    return chunks
+def get_mp4_chunks(d):
+    c = sorted(glob.glob(os.path.join(d, "*.mp4")))
+    if not c: raise FileNotFoundError(f"No .mp4 in {d}")
+    return c
 
 
-def extract_frame(mp4_path: str, which: str = "last") -> np.ndarray:
-    """Extract a frame from an mp4 file using ffmpeg.
-
-    Args:
-        mp4_path: Path to the video file.
-        which: 'first' or 'last'. Default 'last' because the first frame
-               often has separator walls still in the arenas.
-
-    Returns:
-        RGB numpy array (H, W, 3) uint8.
-    """
-    probe_cmd = [
-        "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_streams", "-show_format", mp4_path,
-    ]
-    probe = subprocess.run(probe_cmd, capture_output=True, text=True)
-    if probe.returncode != 0:
-        raise RuntimeError(f"ffprobe failed on {mp4_path}: {probe.stderr}")
-    info = json.loads(probe.stdout)
-    vstream = next(s for s in info["streams"] if s["codec_type"] == "video")
-    w, h = int(vstream["width"]), int(vstream["height"])
-
-    if which == "last":
-        # Get duration, seek near end, take last frame
-        duration = float(info.get("format", {}).get("duration", 0))
-        if duration <= 0:
-            # Try stream-level duration
-            duration = float(vstream.get("duration", 0))
-        # Seek to 1 second before the end (or 0 if very short)
-        seek_time = max(0, duration - 1.0)
-        cmd = [
-            "ffmpeg",
-            "-ss", f"{seek_time:.3f}",
-            "-i", mp4_path,
-            "-update", "1",  # keep overwriting so we get the last frame
-            "-f", "image2pipe", "-pix_fmt", "rgb24",
-            "-vcodec", "rawvideo", "-loglevel", "error", "-"
-        ]
-    else:
-        cmd = [
-            "ffmpeg", "-i", mp4_path, "-frames:v", "1",
-            "-f", "image2pipe", "-pix_fmt", "rgb24",
-            "-vcodec", "rawvideo", "-loglevel", "error", "-"
-        ]
-
-    result = subprocess.run(cmd, capture_output=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {result.stderr.decode()}")
-
-    raw = result.stdout
-    frame_size = h * w * 3
-    if len(raw) < frame_size:
-        raise RuntimeError(
-            f"Not enough data for frame: got {len(raw)} bytes, need {frame_size}"
-        )
-    # Take the LAST complete frame from the output (for 'last' mode,
-    # ffmpeg may output multiple frames from the seek point)
-    n_frames = len(raw) // frame_size
-    offset = (n_frames - 1) * frame_size
-    return np.frombuffer(raw[offset:offset + frame_size], dtype=np.uint8).reshape((h, w, 3))
-
-
-# ┌─────────────────────────────────────────────────────────────────────┐
-# │  CIRCLE DETECTION                                                   │
-# │  Primary: adaptive threshold + contour + minEnclosingCircle (cv2)   │
-# │  Fallback: Hough (cv2 or scipy)                                     │
-# └─────────────────────────────────────────────────────────────────────┘
-def detect_arenas(
-    frame: np.ndarray,
-    n_expected: int = DEFAULT_N_ARENAS,
-    min_radius: int = 0,
-    max_radius: int = 0,
-) -> List[Arena]:
-    """Detect circular arenas. Tries contour method first, then Hough."""
-    try:
-        import cv2
-        arenas = _detect_contour_cv2(frame, n_expected, min_radius, max_radius)
-        if len(arenas) >= max(n_expected // 2, 3):
-            return filter_by_radius(arenas)
-        print(f"  Contour method found {len(arenas)}, trying Hough fallback...")
-        arenas_h = _detect_hough_cv2(frame, n_expected, min_radius, max_radius)
-        best = arenas_h if len(arenas_h) > len(arenas) else arenas
-        return filter_by_radius(best)
-    except ImportError:
-        print("[arena_extractor] OpenCV not found, using scipy fallback.")
-        return filter_by_radius(
-            _detect_hough_scipy(frame, n_expected, min_radius, max_radius)
-        )
-
-
-def _detect_contour_cv2(frame, n_expected, min_radius, max_radius):
-    """Adaptive threshold + contour fitting — robust for bright-on-dark arenas."""
-    import cv2
-    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY) if len(frame.shape) == 3 else frame.copy()
-    h, w = gray.shape[:2]
-    if min_radius == 0:
-        min_radius = int(min(h, w) * 0.04)
-    if max_radius == 0:
-        max_radius = int(min(h, w) * 0.20)
-    min_area = math.pi * min_radius ** 2 * 0.5
-    max_area = math.pi * max_radius ** 2 * 1.5
-
-    # CLAHE + blur
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    blurred = cv2.GaussianBlur(enhanced, (7, 7), 1.5)
-
-    # Adaptive threshold
-    block_size = max_radius * 4 + 1
-    if block_size % 2 == 0:
-        block_size += 1
-    block_size = min(block_size, min(h, w) - 2)
-    if block_size % 2 == 0:
-        block_size -= 1
-    thresh = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, block_size, -5,
+def _probe(mp4):
+    r = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json",
+         "-show_streams", "-show_format", mp4],
+        capture_output=True, text=True,
     )
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    def _extract_circles(cnts, existing=None):
-        existing = existing or []
-        results = []
-        for cnt in cnts:
-            area = cv2.contourArea(cnt)
-            if area < min_area or area > max_area:
-                continue
-            peri = cv2.arcLength(cnt, True)
-            if peri == 0:
-                continue
-            circ = 4.0 * math.pi * area / (peri * peri)
-            if circ < 0.65:
-                continue
-            (cx, cy), radius = cv2.minEnclosingCircle(cnt)
-            if radius < min_radius or radius > max_radius:
-                continue
-            fill = area / (math.pi * radius * radius) if radius > 0 else 0
-            if fill < 0.55:
-                continue
-            # Check for duplicates
-            if any(np.hypot(cx - e.cx, cy - e.cy) < min_radius for e in existing + results):
-                continue
-            results.append(Arena(cx=float(cx), cy=float(cy), r=float(radius)))
-        return results
-
-    candidates = _extract_circles(contours)
-
-    # Otsu fallback if too few
-    if len(candidates) < n_expected // 2:
-        _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        otsu_closed = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, kernel, iterations=2)
-        contours2, _ = cv2.findContours(otsu_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        candidates.extend(_extract_circles(contours2, existing=candidates))
-
-    return sort_arenas_row_major(candidates)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {r.stderr}")
+    info = json.loads(r.stdout)
+    vs = next(s for s in info["streams"] if s["codec_type"] == "video")
+    w, h = int(vs["width"]), int(vs["height"])
+    dur = float(info.get("format", {}).get("duration", 0))
+    if dur <= 0:
+        dur = float(vs.get("duration", 0))
+    fps_parts = vs.get("r_frame_rate", "25/1").split("/")
+    fps = float(fps_parts[0]) / float(fps_parts[1]) if len(fps_parts) == 2 else 25.0
+    return w, h, dur, fps
 
 
-def _detect_hough_cv2(frame, n_expected, min_radius, max_radius):
-    """Hough circle detection fallback."""
-    import cv2
-    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY) if len(frame.shape) == 3 else frame.copy()
-    h, w = gray.shape[:2]
-    if min_radius == 0:
-        min_radius = int(min(h, w) * 0.04)
-    if max_radius == 0:
-        max_radius = int(min(h, w) * 0.20)
+def extract_frame_at(mp4, t, w, h):
+    """Extract a single RGB frame at time t (seconds)."""
+    cmd = [
+        "ffmpeg", "-ss", f"{t:.3f}", "-i", mp4,
+        "-frames:v", "1", "-f", "image2pipe",
+        "-pix_fmt", "rgb24", "-vcodec", "rawvideo",
+        "-loglevel", "error", "-"
+    ]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0 or len(r.stdout) < h * w * 3:
+        return None
+    return np.frombuffer(r.stdout[:h * w * 3], dtype=np.uint8).reshape((h, w, 3))
+
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  MAX-PROJECTION                                                     │
+# │  Sample N frames from 25–100% of each chunk, take pixel-wise max.  │
+# │  Dark flies move → max keeps the bright arena background.           │
+# └─────────────────────────────────────────────────────────────────────┘
+def build_max_projection(chunks: List[str], n_frames: int = N_PROJECTION_FRAMES,
+                         start_frac: float = PROJECTION_START) -> np.ndarray:
+    """Build a max-intensity projection across sampled frames.
+
+    Samples n_frames evenly from start_frac..1.0 of total duration across
+    all chunks. Because flies are dark and move, the per-pixel maximum
+    recovers the bright, static arena background.
+    """
+    # Compute total duration
+    chunk_info = []  # (path, w, h, start_time, end_time)
+    cumulative = 0.0
+    for c in chunks:
+        w, h, dur, fps = _probe(c)
+        chunk_info.append((c, w, h, cumulative, cumulative + dur))
+        cumulative += dur
+
+    total_dur = cumulative
+    if total_dur <= 0:
+        raise RuntimeError("Could not determine video duration")
+
+    W, H = chunk_info[0][1], chunk_info[0][2]
+    t_start = total_dur * start_frac
+    t_end = total_dur * 0.999  # avoid exact end
+
+    sample_times = np.linspace(t_start, t_end, n_frames)
+    projection = np.zeros((H, W, 3), dtype=np.uint8)
+
+    print(f"  Building max-projection ({n_frames} frames, "
+          f"{start_frac:.0%}–100% of {total_dur:.1f}s)...")
+
+    for i, t in enumerate(sample_times):
+        # Find which chunk this time falls in
+        for path, cw, ch, cs, ce in chunk_info:
+            if cs <= t < ce or (t >= ce and path == chunk_info[-1][0]):
+                local_t = t - cs
+                frame = extract_frame_at(path, local_t, W, H)
+                if frame is not None:
+                    projection = np.maximum(projection, frame)
+                break
+        if (i + 1) % 20 == 0:
+            print(f"    {i + 1}/{n_frames} frames sampled")
+
+    return projection
+
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  CIRCLE DETECTION on max-projection                                 │
+# └─────────────────────────────────────────────────────────────────────┘
+def detect_arenas(frame, n_expected=DEFAULT_N_ARENAS, min_r=0, max_r=0):
+    """Hough circle detection on (ideally max-projected) frame."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY) if len(frame.shape) == 3 else frame
+    fh, fw = gray.shape[:2]
+    if min_r == 0: min_r = int(min(fh, fw) * 0.04)
+    if max_r == 0: max_r = int(min(fh, fw) * 0.20)
+
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     blurred = cv2.GaussianBlur(clahe.apply(gray), (9, 9), 2)
+
     best = None
     for p2 in range(80, 8, -3):
         circles = cv2.HoughCircles(
-            blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=min_radius * 2,
-            param1=100, param2=p2, minRadius=min_radius, maxRadius=max_radius,
+            blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=min_r * 2,
+            param1=100, param2=p2, minRadius=min_r, maxRadius=max_r,
         )
         if circles is not None:
             if best is None or circles.shape[1] > best.shape[1]:
                 best = circles
             if circles.shape[1] >= n_expected:
                 break
+
     arenas = []
     if best is not None:
         for c in best[0]:
             arenas.append(Arena(cx=float(c[0]), cy=float(c[1]), r=float(c[2])))
-    return sort_arenas_row_major(arenas)
-
-
-def _detect_hough_scipy(frame, n_expected, min_radius, max_radius):
-    """Scipy/skimage fallback (no OpenCV)."""
-    try:
-        from skimage.transform import hough_circle, hough_circle_peaks
-        from skimage.feature import canny
-        from skimage.color import rgb2gray
-    except ImportError:
-        warnings.warn("Neither OpenCV nor scikit-image found.")
-        return []
-    gray = rgb2gray(frame) if len(frame.shape) == 3 else frame.astype(float) / 255.0
-    h, w = gray.shape[:2]
-    if min_radius == 0:
-        min_radius = int(min(h, w) * 0.04)
-    if max_radius == 0:
-        max_radius = int(min(h, w) * 0.20)
-    edges = canny(gray, sigma=2.0)
-    radii = np.arange(min_radius, max_radius, 3)
-    hough_res = hough_circle(edges, radii)
-    _, cx_arr, cy_arr, r_arr = hough_circle_peaks(
-        hough_res, radii, min_xdistance=min_radius * 2,
-        min_ydistance=min_radius * 2, total_num_peaks=n_expected + 5,
-    )
-    arenas = [Arena(cx=float(cx), cy=float(cy), r=float(r))
-              for cx, cy, r in zip(cx_arr, cy_arr, r_arr)]
-    return sort_arenas_row_major(arenas[:n_expected + 5])
+    return filter_by_radius(sort_arenas_row_major(arenas))
 
 
 # ┌─────────────────────────────────────────────────────────────────────┐
-# │  MULTI-CIRCLE ANNOTATOR GUI                                         │
-# │  Performance: background image rendered ONCE, overlay artists       │
-# │  redrawn via matplotlib blitting during drag operations.            │
+# │  CORNER MASKING                                                     │
+# │  White-out triangular corners in the crop to hide neighbouring      │
+# │  arenas that might confuse identity trackers.                       │
 # └─────────────────────────────────────────────────────────────────────┘
-class MultiCircleEditor:
-    """Interactive matplotlib GUI for editing multiple circular arenas.
+def corner_mask_triangles(crop_w, crop_h, frac=CORNER_MASK):
+    """Return 4 triangle vertex arrays for the corners of a crop.
+
+    Each triangle has legs of length frac * side_length, measured
+    from the corner along each edge.
+
+    Returns list of 4 numpy arrays, each shape (3, 2) int32.
+    """
+    dx = int(crop_w * frac)
+    dy = int(crop_h * frac)
+    return [
+        np.array([[0, 0], [dx, 0], [0, dy]], np.int32),                          # top-left
+        np.array([[crop_w, 0], [crop_w - dx, 0], [crop_w, dy]], np.int32),        # top-right
+        np.array([[0, crop_h], [dx, crop_h], [0, crop_h - dy]], np.int32),        # bottom-left
+        np.array([[crop_w, crop_h], [crop_w - dx, crop_h],
+                  [crop_w, crop_h - dy]], np.int32),                              # bottom-right
+    ]
+
+
+def apply_corner_mask_to_frame(frame, frac=CORNER_MASK, colour=255):
+    """White-out corner triangles on a frame (in-place)."""
+    h, w = frame.shape[:2]
+    for tri in corner_mask_triangles(w, h, frac):
+        cv2.fillPoly(frame, [tri], (colour, colour, colour))
+    return frame
+
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  OPENCV GUI                                                         │
+# │  Uses cv2.imshow — instant rendering, no matplotlib overhead.       │
+# └─────────────────────────────────────────────────────────────────────┘
+COLOURS_BGR = [
+    (136, 255, 0), (102, 68, 255), (255, 170, 68), (0, 170, 255), (255, 68, 170),
+    (204, 102, 255), (204, 221, 0), (68, 221, 255), (68, 255, 136), (68, 136, 255),
+]
+
+
+class ArenaEditorCV2:
+    """Fast OpenCV-based arena editor.
 
     Controls:
-      Drag centre (o)       Move arena
-      Drag rim handle (diamond)  Resize arena
-      Right-click empty     Add new arena
-      Right-click centre    Delete arena
-      A   Re-run detection   +/-  Adjust radii   U  Uniform radii
-      L   Labels   F  Fill   H  Help   S  Save   Q/Enter  Accept
+      Left-drag on centre dot    → move arena
+      Left-drag on rim diamond   → resize arena
+      Right-click empty          → add arena
+      Right-click on centre      → delete arena
+      A   re-run detection
+      +/= increase all radii     -   decrease all radii
+      U   uniform radii (median)
+      C   toggle corner mask preview
+      H   toggle help overlay
+      Q / Enter  accept          Esc  abort
     """
 
-    WINDOW_NAME = "Arena Extractor"
+    WIN = "Arena Extractor"
+    HANDLE_R = 12  # radius for centre/rim hit-testing in display pixels
 
-    def __init__(self, frame, arenas, recording_name="", json_path=""):
-        self.frame = frame
+    def __init__(self, frame_rgb, arenas, recording_name="", json_path=""):
+        self.orig = frame_rgb.copy()
         self.arenas = sort_arenas_row_major(arenas)
-        self.recording_name = recording_name
+        self.rec_name = recording_name
         self.json_path = json_path
-        self._dragging = None
-        self._drag_mode = ""
-        self._drag_offset = (0.0, 0.0)
-        self.show_labels = True
-        self.show_fill = True
+        self.show_corners = True
         self.show_help = False
         self.accepted = False
-        self._overlay_artists = []
 
-        h, w = frame.shape[:2]
-        dpi = 100
-        self.fig, self.ax = plt.subplots(
-            1, 1, figsize=(min(w / dpi, 18), min(h / dpi, 12)), dpi=dpi
-        )
-        self.fig.canvas.manager.set_window_title(self.WINDOW_NAME)
-        self.fig.subplots_adjust(left=0.01, right=0.99, top=0.94, bottom=0.01)
+        # Scale for display
+        h, w = frame_rgb.shape[:2]
+        self.scale = min(1400.0 / w, 900.0 / h, 1.0)
+        self.disp_w = int(w * self.scale)
+        self.disp_h = int(h * self.scale)
 
-        # Display background image ONCE — never cleared
-        if len(frame.shape) == 2:
-            self.ax.imshow(frame, cmap="gray", aspect="equal")
-        else:
-            self.ax.imshow(frame, aspect="equal")
-        self.ax.set_xlim(0, w)
-        self.ax.set_ylim(h, 0)
-        self.ax.set_axis_off()
+        # Drag state
+        self._drag = None   # (arena, mode)  mode='move'|'resize'
+        self._drag_off = (0.0, 0.0)
 
-        self.fig.canvas.mpl_connect("button_press_event", self._on_press)
-        self.fig.canvas.mpl_connect("button_release_event", self._on_release)
-        self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
-        self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+        cv2.namedWindow(self.WIN, cv2.WINDOW_AUTOSIZE)
+        cv2.setMouseCallback(self.WIN, self._mouse_cb)
+        self._render()
+        self._loop()
 
-        self._draw_overlay()
-        plt.show()
+    # ── coordinate conversion ────────────────────────────────────────
+    def _d2f(self, dx, dy):
+        """Display coords → frame coords."""
+        return dx / self.scale, dy / self.scale
 
-    @staticmethod
-    def _colour(idx):
-        return COLOURS[idx % len(COLOURS)]
+    def _f2d(self, fx, fy):
+        """Frame coords → display coords."""
+        return int(fx * self.scale), int(fy * self.scale)
 
-    def _clear_overlay(self):
-        """Remove all overlay artists without touching the background image."""
-        for a in self._overlay_artists:
-            try:
-                a.remove()
-            except ValueError:
-                pass
-        self._overlay_artists.clear()
-
-    def _draw_overlay(self):
-        """Remove old overlay, draw new overlay, refresh display."""
-        self._clear_overlay()
-        h, w = self.frame.shape[:2]
+    # ── rendering ────────────────────────────────────────────────────
+    def _render(self):
+        vis = cv2.cvtColor(self.orig, cv2.COLOR_RGB2BGR)
+        fh, fw = vis.shape[:2]
         self.arenas = sort_arenas_row_major(self.arenas)
 
         for a in self.arenas:
-            col = self._colour(a.idx)
+            col = COLOURS_BGR[a.idx % len(COLOURS_BGR)]
+            cx, cy, r = int(a.cx), int(a.cy), int(a.r)
 
-            # Circle
-            cp = MplCircle(
-                (a.cx, a.cy), a.r,
-                fill=self.show_fill,
-                facecolor=col if self.show_fill else "none",
-                edgecolor=col,
-                alpha=FILL_ALPHA if self.show_fill else EDGE_ALPHA,
-                linewidth=2,
-            )
-            self.ax.add_patch(cp)
-            self._overlay_artists.append(cp)
+            # Filled circle (semi-transparent via overlay)
+            overlay = vis.copy()
+            cv2.circle(overlay, (cx, cy), r, col, -1)
+            cv2.addWeighted(overlay, 0.18, vis, 0.82, 0, vis)
 
-            # Bounding box (padded crop region)
-            bx, by, bw, bh = a.bbox(padding=CROP_PADDING, frame_w=w, frame_h=h)
-            rect = MplRect(
-                (bx, by), bw, bh, fill=False, edgecolor=col,
-                linewidth=1, linestyle="--", alpha=0.5,
-            )
-            self.ax.add_patch(rect)
-            self._overlay_artists.append(rect)
+            # Circle edge
+            cv2.circle(vis, (cx, cy), r, col, 2)
 
-            # Centre marker — use 'o' marker to avoid edgecolor warning with '+'
-            sc = self.ax.scatter(
-                [a.cx], [a.cy], s=CENTRE_SIZE, c=[col],
-                edgecolors=[col], linewidth=1.5, zorder=5, marker="o",
-            )
-            self._overlay_artists.append(sc)
+            # Bounding box (padded crop)
+            bx, by, bw, bh = a.bbox(padding=CROP_PADDING, frame_w=fw, frame_h=fh)
+            cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), col, 1)
 
-            # Rim handle at 3-o'clock
-            sr = self.ax.scatter(
-                [a.cx + a.r], [a.cy], s=RIM_HANDLE_SIZE, c=[col],
-                edgecolors="white", linewidth=1.5, zorder=6, marker="D",
-            )
-            self._overlay_artists.append(sr)
+            # Corner mask preview — diagonal lines in each corner of the bbox
+            if self.show_corners:
+                dx_c = int(bw * CORNER_MASK)
+                dy_c = int(bh * CORNER_MASK)
+                # top-left
+                cv2.line(vis, (bx + dx_c, by), (bx, by + dy_c), (200, 200, 200), 1)
+                # top-right
+                cv2.line(vis, (bx + bw - dx_c, by), (bx + bw, by + dy_c), (200, 200, 200), 1)
+                # bottom-left
+                cv2.line(vis, (bx + dx_c, by + bh), (bx, by + bh - dy_c), (200, 200, 200), 1)
+                # bottom-right
+                cv2.line(vis, (bx + bw - dx_c, by + bh), (bx + bw, by + bh - dy_c), (200, 200, 200), 1)
+
+            # Centre dot
+            cv2.circle(vis, (cx, cy), 6, col, -1)
+            cv2.circle(vis, (cx, cy), 6, (255, 255, 255), 1)
+
+            # Rim handle (diamond at 3 o'clock)
+            rim_x = cx + r
+            pts = np.array([
+                [rim_x, cy - 6], [rim_x + 6, cy],
+                [rim_x, cy + 6], [rim_x - 6, cy],
+            ], np.int32)
+            cv2.fillPoly(vis, [pts], col)
+            cv2.polylines(vis, [pts], True, (255, 255, 255), 1)
 
             # Label
-            if self.show_labels:
-                txt = self.ax.annotate(
-                    f"#{a.idx:02d}", (a.cx, a.cy - a.r - 8),
-                    fontsize=LABEL_FONTSIZE, fontweight="bold",
-                    color="white", ha="center", va="bottom",
-                    bbox=dict(boxstyle="round,pad=0.25", facecolor=col, alpha=0.85),
-                    zorder=7,
-                )
-                self._overlay_artists.append(txt)
+            label = f"#{a.idx:02d}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            lx, ly = cx - tw // 2, cy - r - 12
+            cv2.rectangle(vis, (lx - 4, ly - th - 4), (lx + tw + 4, ly + 4), col, -1)
+            cv2.putText(vis, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (255, 255, 255), 2)
 
+        # Status bar
+        status = (f"{self.rec_name}  |  {len(self.arenas)} arenas  |  "
+                  f"drag=move/resize  RMB=add/del  Q=accept")
+        cv2.putText(vis, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 255, 255), 2)
+
+        # Help overlay
         if self.show_help:
-            txt = self.ax.text(
-                0.02, 0.98,
-                "=== ARENA EXTRACTOR HELP ===\n\n"
-                "MOUSE\n"
-                "  Drag centre (o)      Move arena\n"
-                "  Drag rim handle      Resize arena\n"
-                "  Right-click empty    Add new arena\n"
-                "  Right-click centre   Delete arena\n\n"
-                "KEYS\n"
-                "  A   Re-run detection    +/- Adjust radii\n"
-                "  U   Uniform radii       L   Toggle labels\n"
-                "  F   Toggle fill         H   Toggle help\n"
-                "  S   Save positions      Q   Accept & extract\n\n"
-                f"Arenas: {len(self.arenas)}   Frame: {w} x {h} px",
-                transform=self.ax.transAxes, fontsize=10,
-                fontfamily="monospace", verticalalignment="top",
-                color="white", zorder=10,
-                bbox=dict(boxstyle="round,pad=0.8", facecolor="black",
-                          alpha=0.88, edgecolor="#00ff88", linewidth=1.5),
-            )
-            self._overlay_artists.append(txt)
+            lines = [
+                "MOUSE: drag centre=move, drag rim=resize",
+                "  right-click empty=add, right-click centre=delete",
+                "KEYS: A=re-detect  +/-=radii  U=uniform  C=corners",
+                "  H=help  S=save  Q/Enter=accept  Esc=abort",
+            ]
+            for i, ln in enumerate(lines):
+                cv2.putText(vis, ln, (10, 55 + i * 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 136), 1)
 
-        status = (f"{self.recording_name}  |  {len(self.arenas)} arenas  |  "
-                  f"drag=move/resize  right-click=add/delete  Q=accept")
-        self.ax.set_title(status, fontsize=9, loc="left", pad=6)
-        self.fig.canvas.draw_idle()
+        # Scale to display size
+        if self.scale < 1.0:
+            vis = cv2.resize(vis, (self.disp_w, self.disp_h))
 
-    def _hit_test(self, event):
-        if event.xdata is None:
-            return None, ""
+        cv2.imshow(self.WIN, vis)
+
+    # ── hit testing ──────────────────────────────────────────────────
+    def _hit(self, fx, fy):
+        """Returns (arena, 'move'|'resize') or (None, '')."""
         for a in reversed(self.arenas):
-            rim_x = a.cx + a.r
-            dr = self.ax.transData.transform((rim_x, a.cy))
-            if np.hypot(dr[0] - event.x, dr[1] - event.y) < PICK_RADIUS_PX:
+            # Rim handle
+            if abs(fx - (a.cx + a.r)) < self.HANDLE_R / self.scale and \
+               abs(fy - a.cy) < self.HANDLE_R / self.scale:
                 return a, "resize"
-            dc = self.ax.transData.transform((a.cx, a.cy))
-            if np.hypot(dc[0] - event.x, dc[1] - event.y) < PICK_RADIUS_PX:
+            # Centre
+            if np.hypot(fx - a.cx, fy - a.cy) < self.HANDLE_R / self.scale:
                 return a, "move"
         return None, ""
 
-    def _on_press(self, event):
-        if event.inaxes != self.ax or event.xdata is None:
-            return
-        if event.button == 1:
-            arena, mode = self._hit_test(event)
+    # ── mouse callback ───────────────────────────────────────────────
+    def _mouse_cb(self, event, x, y, flags, param):
+        fx, fy = self._d2f(x, y)
+        fh, fw = self.orig.shape[:2]
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            arena, mode = self._hit(fx, fy)
             if arena:
-                self._dragging = arena
-                self._drag_mode = mode
-                self._drag_offset = (event.xdata - arena.cx, event.ydata - arena.cy)
-        elif event.button == 3:
-            arena, mode = self._hit_test(event)
+                self._drag = (arena, mode)
+                self._drag_off = (fx - arena.cx, fy - arena.cy)
+
+        elif event == cv2.EVENT_MOUSEMOVE and self._drag:
+            a, mode = self._drag
+            if mode == "move":
+                a.cx = float(np.clip(fx - self._drag_off[0], 0, fw))
+                a.cy = float(np.clip(fy - self._drag_off[1], 0, fh))
+            elif mode == "resize":
+                a.r = max(20.0, float(np.hypot(fx - a.cx, fy - a.cy)))
+            self._render()
+
+        elif event == cv2.EVENT_LBUTTONUP:
+            self._drag = None
+            self._render()
+
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            arena, mode = self._hit(fx, fy)
             if arena and mode == "move":
                 self.arenas.remove(arena)
-                self._draw_overlay()
             else:
                 mr = float(np.median([a.r for a in self.arenas])) if self.arenas else 100.0
-                self.arenas.append(Arena(cx=event.xdata, cy=event.ydata, r=mr))
-                self._draw_overlay()
+                self.arenas.append(Arena(cx=fx, cy=fy, r=mr))
+            self._render()
 
-    def _on_release(self, event):
-        if self._dragging is not None:
-            self._dragging = None
-            self._drag_mode = ""
-            self._draw_overlay()
-
-    def _on_motion(self, event):
-        if event.inaxes != self.ax or event.xdata is None:
-            return
-        if self._dragging is not None:
-            a = self._dragging
-            h, w = self.frame.shape[:2]
-            if self._drag_mode == "move":
-                a.cx = float(np.clip(event.xdata - self._drag_offset[0], 0, w))
-                a.cy = float(np.clip(event.ydata - self._drag_offset[1], 0, h))
-            elif self._drag_mode == "resize":
-                a.r = max(20.0, float(np.hypot(event.xdata - a.cx, event.ydata - a.cy)))
-            self._draw_overlay()
-
-    def _on_key(self, event):
-        key = event.key
-        if key in ("q", "enter"):
-            self.accepted = True
-            plt.close(self.fig)
-        elif key == "escape":
-            self.accepted = False
-            plt.close(self.fig)
-        elif key == "a":
-            self.arenas = detect_arenas(self.frame)
-            print(f"[arena_extractor] Re-detected {len(self.arenas)} arenas")
-            self._draw_overlay()
-        elif key in ("+", "="):
-            for a in self.arenas: a.r += 5
-            self._draw_overlay()
-        elif key == "-":
-            for a in self.arenas: a.r = max(20, a.r - 5)
-            self._draw_overlay()
-        elif key == "u":
-            if self.arenas:
-                mr = float(np.median([a.r for a in self.arenas]))
-                for a in self.arenas: a.r = mr
-                self._draw_overlay()
-        elif key == "l":
-            self.show_labels = not self.show_labels
-            self._draw_overlay()
-        elif key == "f":
-            self.show_fill = not self.show_fill
-            self._draw_overlay()
-        elif key == "h":
-            self.show_help = not self.show_help
-            self._draw_overlay()
-        elif key == "s":
-            self._save_json()
+    # ── keyboard loop ────────────────────────────────────────────────
+    def _loop(self):
+        while True:
+            k = cv2.waitKey(30) & 0xFF
+            if k == ord("q") or k == 13:  # q or Enter
+                self.accepted = True; break
+            elif k == 27:  # Esc
+                self.accepted = False; break
+            elif k == ord("a"):
+                self.arenas = detect_arenas(self.orig)
+                print(f"  Re-detected {len(self.arenas)} arenas")
+                self._render()
+            elif k in (ord("+"), ord("=")):
+                for a in self.arenas: a.r += 5
+                self._render()
+            elif k == ord("-"):
+                for a in self.arenas: a.r = max(20, a.r - 5)
+                self._render()
+            elif k == ord("u"):
+                if self.arenas:
+                    mr = float(np.median([a.r for a in self.arenas]))
+                    for a in self.arenas: a.r = mr
+                    self._render()
+            elif k == ord("c"):
+                self.show_corners = not self.show_corners
+                self._render()
+            elif k == ord("h"):
+                self.show_help = not self.show_help
+                self._render()
+            elif k == ord("s"):
+                self._save_json()
+        cv2.destroyAllWindows()
 
     def _save_json(self):
-        path = self.json_path or f"{self.recording_name}_arenas.json"
-        data = {
-            "recording": self.recording_name,
-            "frame_width": self.frame.shape[1],
-            "frame_height": self.frame.shape[0],
-            "arenas": [a.to_dict() for a in sort_arenas_row_major(self.arenas)],
-        }
+        path = self.json_path or f"{self.rec_name}_arenas.json"
         with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-        print(f"[arena_extractor] Saved {len(self.arenas)} arenas -> {path}")
+            json.dump({
+                "recording": self.rec_name,
+                "frame_width": self.orig.shape[1],
+                "frame_height": self.orig.shape[0],
+                "arenas": [a.to_dict() for a in sort_arenas_row_major(self.arenas)],
+            }, f, indent=2)
+        print(f"  Saved {len(self.arenas)} arenas -> {path}")
 
     def get_arenas(self):
-        if self.accepted:
-            return sort_arenas_row_major(self.arenas)
-        return None
+        return sort_arenas_row_major(self.arenas) if self.accepted else None
 
 
 # ┌─────────────────────────────────────────────────────────────────────┐
-# │  FFMPEG CONCAT + CROP                                               │
+# │  FFMPEG CONCAT + CROP + CORNER MASK                                 │
 # └─────────────────────────────────────────────────────────────────────┘
 def build_concat_file(chunks, tmpdir):
-    path = os.path.join(tmpdir, "concat.txt")
-    with open(path, "w") as f:
-        for chunk in chunks:
-            f.write(f"file '{os.path.abspath(chunk)}'\n")
+    p = os.path.join(tmpdir, "concat.txt")
+    with open(p, "w") as f:
+        for c in chunks:
+            f.write(f"file '{os.path.abspath(c)}'\n")
+    return p
+
+
+def _build_corner_mask_png(crop_w, crop_h, tmpdir, frac=CORNER_MASK):
+    """Create a white-on-black mask PNG for corner overlay in ffmpeg."""
+    mask = np.zeros((crop_h, crop_w), dtype=np.uint8)
+    for tri in corner_mask_triangles(crop_w, crop_h, frac):
+        cv2.fillPoly(mask, [tri], 255)
+    path = os.path.join(tmpdir, "corner_mask.png")
+    cv2.imwrite(path, mask)
     return path
 
 
 def concat_and_crop(chunks, arenas, output_dir, recording_name,
                     codec="libx264", crf=18, frame_height=0, frame_width=0,
-                    keep_full=False):
-    """Concatenate chunks and crop each arena with padding."""
+                    keep_full=False, corner_frac=CORNER_MASK):
     os.makedirs(output_dir, exist_ok=True)
     outputs = []
     with tempfile.TemporaryDirectory(prefix="arena_extract_") as tmpdir:
         concat_file = build_concat_file(chunks, tmpdir)
+
         if keep_full:
             full_path = os.path.join(output_dir, f"{recording_name}_full.mp4")
             print(f"  Concatenating full video -> {full_path}")
@@ -677,23 +544,70 @@ def concat_and_crop(chunks, arenas, output_dir, recording_name,
             x, y, w, h = arena.bbox(
                 padding=CROP_PADDING, frame_w=frame_width, frame_h=frame_height,
             )
+
+            # Build corner mask for this crop size
+            mask_path = _build_corner_mask_png(w, h, tmpdir, corner_frac)
+
             out_path = os.path.join(
                 output_dir, f"{recording_name}_arena_{arena.idx:02d}.mp4"
             )
-            print(f"  [{i+1}/{n}] Arena #{arena.idx:02d}  "
-                  f"crop={w}x{h}+{x}+{y} (r={arena.r:.0f}, pad={CROP_PADDING:.0%})  "
+            print(f"  [{i+1}/{n}] #{arena.idx:02d}  "
+                  f"crop={w}x{h}+{x}+{y} (r={arena.r:.0f})  "
                   f"-> {os.path.basename(out_path)}")
+
+            # ffmpeg: crop, then overlay white corner mask
+            # The mask is white-on-black: use it to blend white into corners
+            vf = (
+                f"crop={w}:{h}:{x}:{y},"
+                f"overlay=0:0"
+            )
             result = subprocess.run([
-                "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
-                "-vf", f"crop={w}:{h}:{x}:{y}",
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0", "-i", concat_file,
+                "-loop", "1", "-i", mask_path,
+                "-filter_complex",
+                f"[0:v]crop={w}:{h}:{x}:{y}[cropped];"
+                f"[1:v]format=gray,colorize=color=white:mix_strength=1[mask];"
+                f"[cropped][mask]overlay=0:0:shortest=1",
                 "-c:v", codec, "-crf", str(crf), "-preset", "fast",
                 "-pix_fmt", "yuv420p", "-an", out_path,
             ], capture_output=True)
+
+            # If fancy overlay fails, fall back to simple crop + post-process
             if result.returncode != 0:
-                print(f"    Warning: ffmpeg error: {result.stderr.decode()[-200:]}")
-            else:
-                outputs.append(out_path)
+                # Simple crop, then apply mask with OpenCV post-processing
+                print(f"    Corner overlay via ffmpeg failed, using simple crop...")
+                out_tmp = os.path.join(tmpdir, f"tmp_{arena.idx:02d}.mp4")
+                subprocess.run([
+                    "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
+                    "-vf", f"crop={w}:{h}:{x}:{y}",
+                    "-c:v", codec, "-crf", str(crf), "-preset", "fast",
+                    "-pix_fmt", "yuv420p", "-an", out_tmp,
+                ], capture_output=True, check=True)
+
+                # Post-process: read, apply corner mask, re-encode
+                _postprocess_corner_mask(out_tmp, out_path, w, h, corner_frac, codec, crf)
+
+            outputs.append(out_path)
     return outputs
+
+
+def _postprocess_corner_mask(in_path, out_path, crop_w, crop_h, frac, codec, crf):
+    """Read video, white-out corners frame by frame, re-encode."""
+    cap = cv2.VideoCapture(in_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_path, fourcc, fps, (crop_w, crop_h))
+    triangles = corner_mask_triangles(crop_w, crop_h, frac)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        for tri in triangles:
+            cv2.fillPoly(frame, [tri], (255, 255, 255))
+        writer.write(frame)
+    cap.release()
+    writer.release()
 
 
 # ┌─────────────────────────────────────────────────────────────────────┐
@@ -707,15 +621,8 @@ def _die(msg):
 def parse_args():
     p = argparse.ArgumentParser(
         prog="arena_extractor",
-        description="Arena Extractor v1.1 — detect, verify & crop circular arenas.",
+        description="Arena Extractor v1.2 — detect, verify & crop circular arenas.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "examples:\n"
-            "  %(prog)s /data/droso_18deg_20251002_102448\n"
-            "  %(prog)s /data/recording -o /results/\n"
-            "  %(prog)s /data/recording --arenas arenas.json\n"
-            "  %(prog)s /data/recording -n 8 --padding 0.15\n"
-        ),
     )
     p.add_argument("recording_dir", help="Motif recording directory.")
     p.add_argument("-o", "--output_dir", default=None)
@@ -723,13 +630,15 @@ def parse_args():
     p.add_argument("--arenas", default=None, help="JSON with arena positions (skip GUI).")
     p.add_argument("--crf", type=int, default=18)
     p.add_argument("--codec", default="libx264")
-    p.add_argument("--padding", type=float, default=CROP_PADDING,
-                   help=f"Fractional padding around arena (default: {CROP_PADDING}).")
+    p.add_argument("--padding", type=float, default=CROP_PADDING)
+    p.add_argument("--corner_mask", type=float, default=CORNER_MASK,
+                   help=f"Corner triangle size as fraction of crop side (default: {CORNER_MASK}).")
+    p.add_argument("--no_corner_mask", action="store_true",
+                   help="Disable corner white-out.")
     p.add_argument("--keep_full", action="store_true")
     p.add_argument("--no_gui", action="store_true")
-    p.add_argument("--frame", choices=["first", "last"], default="last",
-                   help="Which frame to use for detection (default: last, "
-                        "avoids separator walls visible in first frames).")
+    p.add_argument("--n_proj_frames", type=int, default=N_PROJECTION_FRAMES,
+                   help=f"Frames for max-projection (default: {N_PROJECTION_FRAMES}).")
     return p.parse_args()
 
 
@@ -744,15 +653,19 @@ def load_arenas_json(path):
 
 def main():
     args = parse_args()
-    global CROP_PADDING
+    global CROP_PADDING, CORNER_MASK
     CROP_PADDING = args.padding
+    if args.no_corner_mask:
+        CORNER_MASK = 0.0
+    else:
+        CORNER_MASK = args.corner_mask
 
     recording_dir = args.recording_dir.rstrip("/")
     recording_name = os.path.basename(recording_dir)
     output_dir = args.output_dir or recording_dir
 
     print("+" + "-" * 44 + "+")
-    print("|  ARENA EXTRACTOR v1.1                      |")
+    print("|  ARENA EXTRACTOR v1.2                      |")
     print("|  detect. adjust. stitch. crop.             |")
     print("+" + "-" * 44 + "+")
 
@@ -760,26 +673,31 @@ def main():
     print(f"  Recording: {recording_name}")
     print(f"  Chunks:    {len(chunks)} .mp4 files")
     print(f"  Output:    {output_dir}")
-    print(f"  Padding:   {CROP_PADDING:.0%}")
 
     if args.arenas:
         arenas = load_arenas_json(args.arenas)
         print(f"  Loaded {len(arenas)} arenas from {args.arenas}")
-        frame = extract_frame(chunks[0], which=args.frame)
-        frame_h, frame_w = frame.shape[:2]
+        # Still need a frame for display
+        w, h, dur, fps = _probe(chunks[0])
+        proj = extract_frame_at(chunks[-1], dur * 0.9 if dur > 0 else 0, w, h)
+        if proj is None:
+            proj = extract_frame_at(chunks[0], 0, w, h)
+        frame_h, frame_w = h, w
     else:
-        print(f"  Extracting {args.frame} frame from first chunk...")
-        frame = extract_frame(chunks[0], which=args.frame)
-        frame_h, frame_w = frame.shape[:2]
+        # Build max-projection for detection
+        proj = build_max_projection(chunks, n_frames=args.n_proj_frames)
+        frame_h, frame_w = proj.shape[:2]
+
         print(f"  Frame size: {frame_w} x {frame_h}")
-        print(f"  Running circle detection (expecting ~{args.n_arenas})...")
-        arenas = detect_arenas(frame, n_expected=args.n_arenas)
-        print(f"  Detected {len(arenas)} arenas (after radius filtering)")
+        print(f"  Running Hough detection on max-projection...")
+        arenas = detect_arenas(proj, n_expected=args.n_arenas)
+        print(f"  Detected {len(arenas)} arenas")
 
         if not args.no_gui:
             json_path = os.path.join(output_dir, f"{recording_name}_arenas.json")
-            editor = MultiCircleEditor(
-                frame, arenas, recording_name=recording_name, json_path=json_path,
+            os.makedirs(output_dir, exist_ok=True)
+            editor = ArenaEditorCV2(
+                proj, arenas, recording_name=recording_name, json_path=json_path,
             )
             arenas = editor.get_arenas()
             if arenas is None:
@@ -796,16 +714,17 @@ def main():
         json.dump({
             "recording": recording_name,
             "frame_width": frame_w, "frame_height": frame_h,
-            "padding": CROP_PADDING,
+            "padding": CROP_PADDING, "corner_mask": CORNER_MASK,
             "arenas": [a.to_dict() for a in arenas],
         }, f, indent=2)
     print(f"\n  Arena positions saved -> {json_out}")
 
-    print(f"\n  Starting extraction ({len(arenas)} arenas x {len(chunks)} chunks)...")
+    print(f"\n  Extracting ({len(arenas)} arenas x {len(chunks)} chunks)...")
     outputs = concat_and_crop(
         chunks=chunks, arenas=arenas, output_dir=output_dir,
         recording_name=recording_name, codec=args.codec, crf=args.crf,
-        frame_height=frame_h, frame_width=frame_w, keep_full=args.keep_full,
+        frame_height=frame_h, frame_width=frame_w,
+        keep_full=args.keep_full, corner_frac=CORNER_MASK,
     )
     print(f"\n  Done! {len(outputs)} files written to {output_dir}")
     for p in outputs:
