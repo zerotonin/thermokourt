@@ -47,7 +47,7 @@ CROP_PADDING = 0.10       # 10 % padding around arena circle
 CORNER_MASK = 0.05        # 5 % of crop side length for corner triangles
 RADIUS_TOLERANCE = 0.25   # reject circles with radius ± 25 % of median
 MIN_ARENAS_FOR_FILTER = 5
-N_PROJECTION_FRAMES = 100 # frames sampled for max-projection
+N_PROJECTION_FRAMES = 10  # frames sampled for max-projection
 PROJECTION_START = 0.25   # start at 25 % of total duration
 
 
@@ -695,7 +695,11 @@ def main():
 
         if not args.no_gui:
             json_path = os.path.join(output_dir, f"{recording_name}_arenas.json")
-            os.makedirs(output_dir, exist_ok=True)
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except PermissionError:
+                _die(f"Cannot create output directory '{output_dir}' — permission denied.\n"
+                     f"       Try a path you own, e.g.  -o ~/results/")
             editor = ArenaEditorCV2(
                 proj, arenas, recording_name=recording_name, json_path=json_path,
             )
@@ -709,7 +713,11 @@ def main():
 
     arenas = sort_arenas_row_major(arenas)
     json_out = os.path.join(output_dir, f"{recording_name}_arenas.json")
-    os.makedirs(output_dir, exist_ok=True)
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except PermissionError:
+        _die(f"Cannot create output directory '{output_dir}' — permission denied.\n"
+             f"       Try a path you own, e.g.  -o ~/results/")
     with open(json_out, "w") as f:
         json.dump({
             "recording": recording_name,
