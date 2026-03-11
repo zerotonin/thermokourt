@@ -336,6 +336,18 @@ class ArenaEditorCV2:
         fh, fw = vis.shape[:2]
         self.arenas = sort_arenas_row_major(self.arenas)
 
+        # Scale all sizes relative to image width so they stay visible
+        # when the window is resized
+        S = fw / 1000.0  # base scale factor (1.0 at 1000px wide)
+        line_w = max(2, int(2 * S))
+        thin_w = max(1, int(1.5 * S))
+        dot_r = max(6, int(8 * S))
+        diamond_r = max(6, int(8 * S))
+        font_scale = max(0.6, 0.8 * S)
+        font_thick = max(2, int(2.5 * S))
+        label_pad = max(4, int(6 * S))
+        status_font = max(0.6, 0.7 * S)
+
         for a in self.arenas:
             col = COLOURS_BGR[a.idx % len(COLOURS_BGR)]
             cx, cy, r = int(a.cx), int(a.cy), int(a.r)
@@ -346,63 +358,110 @@ class ArenaEditorCV2:
             cv2.addWeighted(overlay, 0.18, vis, 0.82, 0, vis)
 
             # Circle edge
-            cv2.circle(vis, (cx, cy), r, col, 2)
+            cv2.circle(vis, (cx, cy), r, col, line_w)
 
             # Bounding box (padded crop)
             bx, by, bw, bh = a.bbox(padding=CROP_PADDING, frame_w=fw, frame_h=fh)
-            cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), col, 1)
+            cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), col, thin_w)
 
             # Corner mask preview — diagonal lines in each corner of the bbox
             if self.show_corners:
                 dx_c = int(bw * CORNER_MASK)
                 dy_c = int(bh * CORNER_MASK)
-                # top-left
-                cv2.line(vis, (bx + dx_c, by), (bx, by + dy_c), (200, 200, 200), 1)
-                # top-right
-                cv2.line(vis, (bx + bw - dx_c, by), (bx + bw, by + dy_c), (200, 200, 200), 1)
-                # bottom-left
-                cv2.line(vis, (bx + dx_c, by + bh), (bx, by + bh - dy_c), (200, 200, 200), 1)
-                # bottom-right
-                cv2.line(vis, (bx + bw - dx_c, by + bh), (bx + bw, by + bh - dy_c), (200, 200, 200), 1)
+                corner_w = max(2, int(2 * S))
+                cv2.line(vis, (bx + dx_c, by), (bx, by + dy_c), (220, 220, 220), corner_w)
+                cv2.line(vis, (bx + bw - dx_c, by), (bx + bw, by + dy_c), (220, 220, 220), corner_w)
+                cv2.line(vis, (bx + dx_c, by + bh), (bx, by + bh - dy_c), (220, 220, 220), corner_w)
+                cv2.line(vis, (bx + bw - dx_c, by + bh), (bx + bw, by + bh - dy_c), (220, 220, 220), corner_w)
 
             # Centre dot
-            cv2.circle(vis, (cx, cy), 6, col, -1)
-            cv2.circle(vis, (cx, cy), 6, (255, 255, 255), 1)
+            cv2.circle(vis, (cx, cy), dot_r, col, -1)
+            cv2.circle(vis, (cx, cy), dot_r, (255, 255, 255), max(1, thin_w))
 
             # Rim handle (diamond at 3 o'clock)
             rim_x = cx + r
+            d = diamond_r
             pts = np.array([
-                [rim_x, cy - 6], [rim_x + 6, cy],
-                [rim_x, cy + 6], [rim_x - 6, cy],
+                [rim_x, cy - d], [rim_x + d, cy],
+                [rim_x, cy + d], [rim_x - d, cy],
             ], np.int32)
             cv2.fillPoly(vis, [pts], col)
-            cv2.polylines(vis, [pts], True, (255, 255, 255), 1)
+            cv2.polylines(vis, [pts], True, (255, 255, 255), max(1, thin_w))
 
             # Label
             label = f"#{a.idx:02d}"
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-            lx, ly = cx - tw // 2, cy - r - 12
-            cv2.rectangle(vis, (lx - 4, ly - th - 4), (lx + tw + 4, ly + 4), col, -1)
-            cv2.putText(vis, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                        (255, 255, 255), 2)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
+                                          font_scale, font_thick)
+            lx = cx - tw // 2
+            ly = cy - r - int(15 * S)
+            cv2.rectangle(vis, (lx - label_pad, ly - th - label_pad),
+                          (lx + tw + label_pad, ly + label_pad), col, -1)
+            cv2.putText(vis, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX,
+                        font_scale, (255, 255, 255), font_thick)
 
-        # Status bar
+        # Status bar at top
         status = (f"{self.rec_name}  |  {len(self.arenas)} arenas  |  "
-                  f"drag=move/resize  RMB=add/del  Q=accept")
-        cv2.putText(vis, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (255, 255, 255), 2)
+                  f"F1=help  Q=accept")
+        # Dark background for readability
+        (sw, sh), _ = cv2.getTextSize(status, cv2.FONT_HERSHEY_SIMPLEX,
+                                      status_font, font_thick)
+        cv2.rectangle(vis, (0, 0), (sw + 20, sh + int(20 * S)),
+                      (0, 0, 0), -1)
+        cv2.putText(vis, status, (10, sh + int(10 * S)),
+                    cv2.FONT_HERSHEY_SIMPLEX, status_font,
+                    (255, 255, 255), font_thick)
 
-        # Help overlay
+        # F1 Help overlay
         if self.show_help:
-            lines = [
-                "MOUSE: drag centre=move, drag rim=resize",
-                "  right-click empty=add, right-click centre=delete",
-                "KEYS: A=re-detect  +/-=radii  U=uniform  C=corners",
-                "  H=help  S=save  Q/Enter=accept  Esc=abort",
+            help_lines = [
+                "ARENA EXTRACTOR — CONTROLS",
+                "",
+                "MOUSE",
+                "  Left-drag centre dot    Move arena",
+                "  Left-drag rim diamond   Resize arena",
+                "  Right-click empty       Add new arena",
+                "  Right-click on centre   Delete arena",
+                "",
+                "KEYBOARD",
+                "  A          Re-run auto-detection",
+                "  + / =      Increase all radii by 5px",
+                "  -          Decrease all radii by 5px",
+                "  U          Set all radii to median",
+                "  C          Toggle corner mask preview",
+                "  S          Save arena positions to JSON",
+                "  F1 / H     Toggle this help",
+                "  Q / Enter  Accept and start extraction",
+                "  Escape     Abort (no extraction)",
+                "",
+                f"  Arenas: {len(self.arenas)}    "
+                f"Frame: {fw} x {fh} px",
             ]
-            for i, ln in enumerate(lines):
-                cv2.putText(vis, ln, (10, 55 + i * 22),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 136), 1)
+            help_font = max(0.5, 0.6 * S)
+            help_thick = max(1, int(1.5 * S))
+            line_h = int(25 * S)
+            pad = int(15 * S)
+            # Measure help box size
+            max_tw = 0
+            for ln in help_lines:
+                (tw2, _), _ = cv2.getTextSize(ln, cv2.FONT_HERSHEY_SIMPLEX,
+                                              help_font, help_thick)
+                max_tw = max(max_tw, tw2)
+            box_w = max_tw + 3 * pad
+            box_h = len(help_lines) * line_h + 2 * pad
+            x0 = int(20 * S)
+            y0 = int(50 * S)
+            # Semi-transparent background
+            overlay_help = vis.copy()
+            cv2.rectangle(overlay_help, (x0, y0), (x0 + box_w, y0 + box_h),
+                          (0, 0, 0), -1)
+            cv2.rectangle(overlay_help, (x0, y0), (x0 + box_w, y0 + box_h),
+                          (0, 200, 100), max(1, int(S)))
+            cv2.addWeighted(overlay_help, 0.85, vis, 0.15, 0, vis)
+            for j, ln in enumerate(help_lines):
+                col_txt = (0, 255, 136) if j == 0 else (220, 220, 220)
+                cv2.putText(vis, ln, (x0 + pad, y0 + pad + (j + 1) * line_h),
+                            cv2.FONT_HERSHEY_SIMPLEX, help_font, col_txt,
+                            help_thick)
 
         # WINDOW_NORMAL handles display scaling — show at full resolution
         cv2.imshow(self.WIN, vis)
@@ -455,33 +514,37 @@ class ArenaEditorCV2:
     # ── keyboard loop ────────────────────────────────────────────────
     def _loop(self):
         while True:
-            k = cv2.waitKey(30) & 0xFF
-            if k == ord("q") or k == 13:  # q or Enter
+            k = cv2.waitKeyEx(30)  # waitKeyEx to capture F-keys
+            k_low = k & 0xFF
+
+            if k_low == ord("q") or k_low == 13:  # q or Enter
                 self.accepted = True; break
-            elif k == 27:  # Esc
+            elif k_low == 27:  # Esc
                 self.accepted = False; break
-            elif k == ord("a"):
+            # F1: key code varies by platform
+            # Linux/X11: 0xFFBE (65470), Windows: 0x700000, macOS: varies
+            elif k in (65470, 7340032) or k_low == ord("h"):
+                self.show_help = not self.show_help
+                self._render()
+            elif k_low == ord("a"):
                 self.arenas = detect_arenas(self.orig)
                 print(f"  Re-detected {len(self.arenas)} arenas")
                 self._render()
-            elif k in (ord("+"), ord("=")):
+            elif k_low in (ord("+"), ord("=")):
                 for a in self.arenas: a.r += 5
                 self._render()
-            elif k == ord("-"):
+            elif k_low == ord("-"):
                 for a in self.arenas: a.r = max(20, a.r - 5)
                 self._render()
-            elif k == ord("u"):
+            elif k_low == ord("u"):
                 if self.arenas:
                     mr = float(np.median([a.r for a in self.arenas]))
                     for a in self.arenas: a.r = mr
                     self._render()
-            elif k == ord("c"):
+            elif k_low == ord("c"):
                 self.show_corners = not self.show_corners
                 self._render()
-            elif k == ord("h"):
-                self.show_help = not self.show_help
-                self._render()
-            elif k == ord("s"):
+            elif k_low == ord("s"):
                 self._save_json()
         cv2.destroyAllWindows()
 
@@ -511,11 +574,53 @@ def build_concat_file(chunks, tmpdir):
     return p
 
 
+def _get_total_frames(chunks):
+    """Estimate total frame count across all chunks."""
+    total = 0
+    for c in chunks:
+        w, h, dur, fps = _probe(c)
+        total += int(dur * fps)
+    return total
+
+
+def _run_ffmpeg_with_progress(cmd, total_frames, label=""):
+    """Run an ffmpeg command and print progress based on frame count."""
+    import time
+    proc = subprocess.Popen(
+        cmd + ["-progress", "pipe:1", "-nostats"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    last_print = 0
+    frame_count = 0
+    while True:
+        line = proc.stdout.readline()
+        if not line and proc.poll() is not None:
+            break
+        line = line.decode("utf-8", errors="replace").strip()
+        if line.startswith("frame="):
+            try:
+                frame_count = int(line.split("=")[1])
+            except ValueError:
+                pass
+            now = time.monotonic()
+            if total_frames > 0 and now - last_print >= 2.0:
+                pct = min(100, frame_count * 100 // total_frames)
+                print(f"\r    {label} {pct:3d}% ({frame_count}/{total_frames} frames)",
+                      end="", flush=True)
+                last_print = now
+    proc.wait()
+    if total_frames > 0:
+        print(f"\r    {label} 100% ({total_frames}/{total_frames} frames)   ")
+    return proc.returncode, proc.stderr.read().decode("utf-8", errors="replace")
+
+
 def concat_and_crop(chunks, arenas, output_dir, recording_name,
                     codec="libx264", crf=18, frame_height=0, frame_width=0,
                     keep_full=False, corner_frac=CORNER_MASK):
     os.makedirs(output_dir, exist_ok=True)
     outputs = []
+    total_frames = _get_total_frames(chunks)
+
     with tempfile.TemporaryDirectory(prefix="arena_extract_") as tmpdir:
         concat_file = build_concat_file(chunks, tmpdir)
 
@@ -529,6 +634,9 @@ def concat_and_crop(chunks, arenas, output_dir, recording_name,
             outputs.append(full_path)
 
         n = len(arenas)
+        import time
+        t_start_all = time.monotonic()
+
         for i, arena in enumerate(arenas):
             x, y, w, h = arena.bbox(
                 padding=CROP_PADDING, frame_w=frame_width, frame_h=frame_height,
@@ -537,46 +645,73 @@ def concat_and_crop(chunks, arenas, output_dir, recording_name,
             out_path = os.path.join(
                 output_dir, f"{recording_name}_arena_{arena.idx:02d}.mp4"
             )
+
+            # Estimate remaining time
+            if i > 0:
+                elapsed = time.monotonic() - t_start_all
+                per_arena = elapsed / i
+                remaining = per_arena * (n - i)
+                eta = f"  ~{remaining / 60:.0f}min left" if remaining > 60 else f"  ~{remaining:.0f}s left"
+            else:
+                eta = ""
+
             print(f"  [{i+1}/{n}] #{arena.idx:02d}  "
-                  f"crop={w}x{h}+{x}+{y} (r={arena.r:.0f})  "
-                  f"-> {os.path.basename(out_path)}")
+                  f"crop={w}x{h}+{x}+{y} (r={arena.r:.0f}){eta}")
 
             if corner_frac > 0:
-                # Crop with ffmpeg, then apply corner mask with OpenCV
                 out_tmp = os.path.join(tmpdir, f"tmp_{arena.idx:02d}.mp4")
-                result = subprocess.run([
+                cmd = [
                     "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
                     "-vf", f"crop={w}:{h}:{x}:{y}",
                     "-c:v", codec, "-crf", str(crf), "-preset", "fast",
                     "-pix_fmt", "yuv420p", "-an", out_tmp,
-                ], capture_output=True)
-                if result.returncode != 0:
-                    print(f"    Warning: ffmpeg crop failed: {result.stderr.decode()[-200:]}")
+                ]
+                rc, err = _run_ffmpeg_with_progress(cmd, total_frames,
+                                                    label=f"Cropping #{arena.idx:02d}")
+                if rc != 0:
+                    print(f"    Warning: ffmpeg crop failed: {err[-200:]}")
                     continue
-                _postprocess_corner_mask(out_tmp, out_path, w, h, corner_frac, codec, crf)
+                print(f"    Applying corner mask...")
+                _postprocess_corner_mask(out_tmp, out_path, w, h, corner_frac)
             else:
-                # No corner mask — just crop
-                result = subprocess.run([
+                cmd = [
                     "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
                     "-vf", f"crop={w}:{h}:{x}:{y}",
                     "-c:v", codec, "-crf", str(crf), "-preset", "fast",
                     "-pix_fmt", "yuv420p", "-an", out_path,
-                ], capture_output=True)
-                if result.returncode != 0:
-                    print(f"    Warning: ffmpeg error: {result.stderr.decode()[-200:]}")
+                ]
+                rc, err = _run_ffmpeg_with_progress(cmd, total_frames,
+                                                    label=f"Cropping #{arena.idx:02d}")
+                if rc != 0:
+                    print(f"    Warning: ffmpeg error: {err[-200:]}")
                     continue
 
+            # Report output file size
+            if os.path.exists(out_path):
+                sz = os.path.getsize(out_path)
+                if sz > 1e9:
+                    print(f"    -> {os.path.basename(out_path)} ({sz / 1e9:.1f} GB)")
+                else:
+                    print(f"    -> {os.path.basename(out_path)} ({sz / 1e6:.1f} MB)")
+
             outputs.append(out_path)
+
+        total_time = time.monotonic() - t_start_all
+        print(f"\n  Total extraction time: {total_time / 60:.1f} min")
     return outputs
 
 
-def _postprocess_corner_mask(in_path, out_path, crop_w, crop_h, frac, codec, crf):
+def _postprocess_corner_mask(in_path, out_path, crop_w, crop_h, frac):
     """Read video, white-out corners frame by frame, re-encode."""
     cap = cv2.VideoCapture(in_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, fps, (crop_w, crop_h))
     triangles = corner_mask_triangles(crop_w, crop_h, frac)
+    import time
+    count = 0
+    last_print = time.monotonic()
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -584,8 +719,17 @@ def _postprocess_corner_mask(in_path, out_path, crop_w, crop_h, frac, codec, crf
         for tri in triangles:
             cv2.fillPoly(frame, [tri], (255, 255, 255))
         writer.write(frame)
+        count += 1
+        now = time.monotonic()
+        if total > 0 and now - last_print >= 2.0:
+            pct = count * 100 // total
+            print(f"\r    Corner mask {pct:3d}% ({count}/{total})",
+                  end="", flush=True)
+            last_print = now
     cap.release()
     writer.release()
+    if total > 0:
+        print(f"\r    Corner mask 100% ({total}/{total})   ")
 
 
 # ┌─────────────────────────────────────────────────────────────────────┐
