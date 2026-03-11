@@ -303,29 +303,32 @@ class ArenaEditorCV2:
         self.show_help = False
         self.accepted = False
 
-        # Scale for display
+        # Display: render at full res, let OpenCV window handle scaling
         h, w = frame_rgb.shape[:2]
-        self.scale = min(1400.0 / w, 900.0 / h, 1.0)
-        self.disp_w = int(w * self.scale)
-        self.disp_h = int(h * self.scale)
+        self.scale = 1.0  # all coordinates are in full-res frame space
+        target_w = min(w, 1920)
+        target_h = int(h * (target_w / w))
 
         # Drag state
         self._drag = None   # (arena, mode)  mode='move'|'resize'
         self._drag_off = (0.0, 0.0)
 
-        cv2.namedWindow(self.WIN, cv2.WINDOW_AUTOSIZE)
+        cv2.namedWindow(self.WIN, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.WIN, target_w, target_h)
         cv2.setMouseCallback(self.WIN, self._mouse_cb)
         self._render()
         self._loop()
 
     # ── coordinate conversion ────────────────────────────────────────
     def _d2f(self, dx, dy):
-        """Display coords → frame coords."""
-        return dx / self.scale, dy / self.scale
+        """Display coords → frame coords.
+        With WINDOW_NORMAL, OpenCV maps mouse coords to image coords
+        automatically, so display coords == frame coords."""
+        return float(dx), float(dy)
 
     def _f2d(self, fx, fy):
-        """Frame coords → display coords."""
-        return int(fx * self.scale), int(fy * self.scale)
+        """Frame coords → display coords (identity with WINDOW_NORMAL)."""
+        return int(fx), int(fy)
 
     # ── rendering ────────────────────────────────────────────────────
     def _render(self):
@@ -401,22 +404,18 @@ class ArenaEditorCV2:
                 cv2.putText(vis, ln, (10, 55 + i * 22),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 136), 1)
 
-        # Scale to display size
-        if self.scale < 1.0:
-            vis = cv2.resize(vis, (self.disp_w, self.disp_h))
-
+        # WINDOW_NORMAL handles display scaling — show at full resolution
         cv2.imshow(self.WIN, vis)
 
     # ── hit testing ──────────────────────────────────────────────────
     def _hit(self, fx, fy):
         """Returns (arena, 'move'|'resize') or (None, '')."""
+        # Hit radius in frame pixels — scale with image size
+        hit_r = max(15, self.orig.shape[1] * 0.008)
         for a in reversed(self.arenas):
-            # Rim handle
-            if abs(fx - (a.cx + a.r)) < self.HANDLE_R / self.scale and \
-               abs(fy - a.cy) < self.HANDLE_R / self.scale:
+            if abs(fx - (a.cx + a.r)) < hit_r and abs(fy - a.cy) < hit_r:
                 return a, "resize"
-            # Centre
-            if np.hypot(fx - a.cx, fy - a.cy) < self.HANDLE_R / self.scale:
+            if np.hypot(fx - a.cx, fy - a.cy) < hit_r:
                 return a, "move"
         return None, ""
 
@@ -512,16 +511,6 @@ def build_concat_file(chunks, tmpdir):
     return p
 
 
-def _build_corner_mask_png(crop_w, crop_h, tmpdir, frac=CORNER_MASK):
-    """Create a white-on-black mask PNG for corner overlay in ffmpeg."""
-    mask = np.zeros((crop_h, crop_w), dtype=np.uint8)
-    for tri in corner_mask_triangles(crop_w, crop_h, frac):
-        cv2.fillPoly(mask, [tri], 255)
-    path = os.path.join(tmpdir, "corner_mask.png")
-    cv2.imwrite(path, mask)
-    return path
-
-
 def concat_and_crop(chunks, arenas, output_dir, recording_name,
                     codec="libx264", crf=18, frame_height=0, frame_width=0,
                     keep_full=False, corner_frac=CORNER_MASK):
@@ -545,9 +534,6 @@ def concat_and_crop(chunks, arenas, output_dir, recording_name,
                 padding=CROP_PADDING, frame_w=frame_width, frame_h=frame_height,
             )
 
-            # Build corner mask for this crop size
-            mask_path = _build_corner_mask_png(w, h, tmpdir, corner_frac)
-
             out_path = os.path.join(
                 output_dir, f"{recording_name}_arena_{arena.idx:02d}.mp4"
             )
@@ -555,38 +541,30 @@ def concat_and_crop(chunks, arenas, output_dir, recording_name,
                   f"crop={w}x{h}+{x}+{y} (r={arena.r:.0f})  "
                   f"-> {os.path.basename(out_path)}")
 
-            # ffmpeg: crop, then overlay white corner mask
-            # The mask is white-on-black: use it to blend white into corners
-            vf = (
-                f"crop={w}:{h}:{x}:{y},"
-                f"overlay=0:0"
-            )
-            result = subprocess.run([
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0", "-i", concat_file,
-                "-loop", "1", "-i", mask_path,
-                "-filter_complex",
-                f"[0:v]crop={w}:{h}:{x}:{y}[cropped];"
-                f"[1:v]format=gray,colorize=color=white:mix_strength=1[mask];"
-                f"[cropped][mask]overlay=0:0:shortest=1",
-                "-c:v", codec, "-crf", str(crf), "-preset", "fast",
-                "-pix_fmt", "yuv420p", "-an", out_path,
-            ], capture_output=True)
-
-            # If fancy overlay fails, fall back to simple crop + post-process
-            if result.returncode != 0:
-                # Simple crop, then apply mask with OpenCV post-processing
-                print(f"    Corner overlay via ffmpeg failed, using simple crop...")
+            if corner_frac > 0:
+                # Crop with ffmpeg, then apply corner mask with OpenCV
                 out_tmp = os.path.join(tmpdir, f"tmp_{arena.idx:02d}.mp4")
-                subprocess.run([
+                result = subprocess.run([
                     "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
                     "-vf", f"crop={w}:{h}:{x}:{y}",
                     "-c:v", codec, "-crf", str(crf), "-preset", "fast",
                     "-pix_fmt", "yuv420p", "-an", out_tmp,
-                ], capture_output=True, check=True)
-
-                # Post-process: read, apply corner mask, re-encode
+                ], capture_output=True)
+                if result.returncode != 0:
+                    print(f"    Warning: ffmpeg crop failed: {result.stderr.decode()[-200:]}")
+                    continue
                 _postprocess_corner_mask(out_tmp, out_path, w, h, corner_frac, codec, crf)
+            else:
+                # No corner mask — just crop
+                result = subprocess.run([
+                    "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
+                    "-vf", f"crop={w}:{h}:{x}:{y}",
+                    "-c:v", codec, "-crf", str(crf), "-preset", "fast",
+                    "-pix_fmt", "yuv420p", "-an", out_path,
+                ], capture_output=True)
+                if result.returncode != 0:
+                    print(f"    Warning: ffmpeg error: {result.stderr.decode()[-200:]}")
+                    continue
 
             outputs.append(out_path)
     return outputs
