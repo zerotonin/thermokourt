@@ -2,7 +2,7 @@
 
 **A modular pipeline for analysing *Drosophila* courtship and aggression under thermal manipulation.**
 
-ThermoKourt is a toolbox for behavioural neuroscientists studying how temperature modulates social behaviour in *Drosophila melanogaster*. It covers the full arc from raw multi-camera recordings to publication-ready ethograms and automated behavioural classifiers.
+ThermoKourt is a toolbox for behavioural neuroscientists studying how temperature modulates social behaviour in *Drosophila melanogaster*. It covers the full arc from raw multi-arena recordings to publication-ready ethograms and automated behavioural classifiers.
 
 > **Name:** *Thermo* (temperature) + *Kourt* (courtship, with a nod to the German *kurz*—short, as in short behavioural bouts). The K also disambiguates from generic "court" in search results.
 
@@ -11,17 +11,17 @@ ThermoKourt is a toolbox for behavioural neuroscientists studying how temperatur
 ## Pipeline overview
 
 ```
- ┌─────────────────┐     ┌─────────────────┐     ┌────────────────────┐
+ ┌──────────────────┐     ┌──────────────────┐     ┌────────────────────┐
  │  1 · ARENA       │     │  2 · IDENTITY    │     │  3 · OVERLAY       │
  │  arena_extractor │────▶│  idtracker.ai /  │────▶│  identity_overlay  │
  │  stitch + crop   │     │  CNN tracker     │     │  colour-coded IDs  │
- └─────────────────┘     └─────────────────┘     └────────────────────┘
-                                                          │
- ┌─────────────────┐     ┌─────────────────┐              ▼
+ └──────────────────┘     └──────────────────┘     └────────────────────┘
+                                                            │
+ ┌──────────────────┐     ┌──────────────────┐              ▼
  │  5 · AUTO-SCORE  │◀────│  4 · ETHOGRAM    │◀─── overlay videos
  │  CNN classifier  │     │  GameThogram     │     ready for scoring
  │  (Aoraki HPC)    │     │  manual scoring  │
- └─────────────────┘     └─────────────────┘
+ └──────────────────┘     └──────────────────┘
 ```
 
 | Stage | Module | Purpose | Key dependency |
