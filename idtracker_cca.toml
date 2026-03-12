@@ -1,8 +1,8 @@
 video_paths = [
-    '/home/geuba03p/results/droso_18deg_20251002_102448_arena_02.mp4',
+    '/home/geuba03p/cca_movies/droso_18deg_20251002_102448_arena_08.mp4',
 ]
-intensity_ths = [0, 122]
-area_ths = [50.0, inf]
+intensity_ths = [0, 127]
+area_ths = [50, 4000]
 tracking_intervals = ""
 number_of_animals = 3
 use_bkg = false
