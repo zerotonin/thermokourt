@@ -587,14 +587,97 @@ def _get_total_frames(chunks):
     return total
 
 
-def _run_ffmpeg_with_progress(cmd, total_frames, label=""):
-    """Run an ffmpeg command and print progress based on frame count."""
+def _extract_single_arena(args_dict):
+    """Extract a single arena — designed to be called from Pool.map().
+
+    args_dict keys: concat_file, arena_dict, output_dir, recording_name,
+                    codec, crf, frame_width, frame_height, corner_frac,
+                    total_frames, arena_index, n_arenas
+    """
+    import time
+
+    d = args_dict
+    arena = Arena.from_dict(d["arena_dict"])
+    concat_file = d["concat_file"]
+    output_dir = d["output_dir"]
+    recording_name = d["recording_name"]
+    codec = d["codec"]
+    crf = d["crf"]
+    corner_frac = d["corner_frac"]
+    total_frames = d["total_frames"]
+    idx = d["arena_index"]
+    n = d["n_arenas"]
+
+    x, y, w, h = arena.bbox(
+        padding=d.get("padding", CROP_PADDING),
+        frame_w=d["frame_width"],
+        frame_h=d["frame_height"],
+    )
+
+    out_path = os.path.join(
+        output_dir, f"{recording_name}_arena_{arena.idx:02d}.mp4"
+    )
+
+    # ── RESUME: skip if output already exists and looks complete ──────
+    if os.path.exists(out_path):
+        sz = os.path.getsize(out_path)
+        if sz > 1024:  # > 1 KB = probably a valid file
+            sz_str = f"{sz / 1e6:.1f} MB" if sz < 1e9 else f"{sz / 1e9:.1f} GB"
+            print(f"  [{idx+1}/{n}] #{arena.idx:02d}  SKIP (exists, {sz_str})")
+            return out_path
+
+    tag = f"[{idx+1}/{n}] #{arena.idx:02d}"
+    print(f"  {tag}  crop={w}x{h}+{x}+{y} (r={arena.r:.0f})")
+
+    t0 = time.monotonic()
+
+    if corner_frac > 0:
+        # Crop to temp, then apply corner mask
+        out_tmp = out_path + ".tmp.mp4"
+        rc = _run_ffmpeg_quiet(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
+             "-vf", f"crop={w}:{h}:{x}:{y}",
+             "-c:v", codec, "-crf", str(crf), "-preset", "fast",
+             "-pix_fmt", "yuv420p", "-an", out_tmp],
+            total_frames, tag=f"    {tag} crop"
+        )
+        if rc != 0:
+            print(f"    {tag} WARNING: ffmpeg crop failed")
+            return None
+        _postprocess_corner_mask(out_tmp, out_path, w, h, corner_frac, tag=tag)
+        try:
+            os.remove(out_tmp)
+        except OSError:
+            pass
+    else:
+        rc = _run_ffmpeg_quiet(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
+             "-vf", f"crop={w}:{h}:{x}:{y}",
+             "-c:v", codec, "-crf", str(crf), "-preset", "fast",
+             "-pix_fmt", "yuv420p", "-an", out_path],
+            total_frames, tag=f"    {tag} crop"
+        )
+        if rc != 0:
+            print(f"    {tag} WARNING: ffmpeg failed")
+            return None
+
+    elapsed = time.monotonic() - t0
+    if os.path.exists(out_path):
+        sz = os.path.getsize(out_path)
+        sz_str = f"{sz / 1e6:.1f} MB" if sz < 1e9 else f"{sz / 1e9:.1f} GB"
+        print(f"    {tag} done in {elapsed:.0f}s -> {sz_str}")
+
+    return out_path
+
+
+def _run_ffmpeg_quiet(cmd, total_frames, tag=""):
+    """Run ffmpeg with periodic progress to stdout. Returns returncode."""
     import time
     proc = subprocess.Popen(
         cmd + ["-progress", "pipe:1", "-nostats"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
-    last_print = 0
+    last_print = time.monotonic()
     frame_count = 0
     while True:
         line = proc.stdout.readline()
@@ -607,113 +690,23 @@ def _run_ffmpeg_with_progress(cmd, total_frames, label=""):
             except ValueError:
                 pass
             now = time.monotonic()
-            if total_frames > 0 and now - last_print >= 2.0:
+            if total_frames > 0 and now - last_print >= 5.0:
                 pct = min(100, frame_count * 100 // total_frames)
-                print(f"\r    {label} {pct:3d}% ({frame_count}/{total_frames} frames)",
-                      end="", flush=True)
+                print(f"    {tag} {pct}%", flush=True)
                 last_print = now
     proc.wait()
-    if total_frames > 0:
-        print(f"\r    {label} 100% ({total_frames}/{total_frames} frames)   ")
-    return proc.returncode, proc.stderr.read().decode("utf-8", errors="replace")
+    return proc.returncode
 
 
-def concat_and_crop(chunks, arenas, output_dir, recording_name,
-                    codec="libx264", crf=18, frame_height=0, frame_width=0,
-                    keep_full=False, corner_frac=CORNER_MASK):
-    os.makedirs(output_dir, exist_ok=True)
-    outputs = []
-    total_frames = _get_total_frames(chunks)
-
-    with tempfile.TemporaryDirectory(prefix="arena_extract_") as tmpdir:
-        concat_file = build_concat_file(chunks, tmpdir)
-
-        if keep_full:
-            full_path = os.path.join(output_dir, f"{recording_name}_full.mp4")
-            print(f"  Concatenating full video -> {full_path}")
-            subprocess.run([
-                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                "-i", concat_file, "-c", "copy", full_path,
-            ], check=True, capture_output=True)
-            outputs.append(full_path)
-
-        n = len(arenas)
-        import time
-        t_start_all = time.monotonic()
-
-        for i, arena in enumerate(arenas):
-            x, y, w, h = arena.bbox(
-                padding=CROP_PADDING, frame_w=frame_width, frame_h=frame_height,
-            )
-
-            out_path = os.path.join(
-                output_dir, f"{recording_name}_arena_{arena.idx:02d}.mp4"
-            )
-
-            # Estimate remaining time
-            if i > 0:
-                elapsed = time.monotonic() - t_start_all
-                per_arena = elapsed / i
-                remaining = per_arena * (n - i)
-                eta = f"  ~{remaining / 60:.0f}min left" if remaining > 60 else f"  ~{remaining:.0f}s left"
-            else:
-                eta = ""
-
-            print(f"  [{i+1}/{n}] #{arena.idx:02d}  "
-                  f"crop={w}x{h}+{x}+{y} (r={arena.r:.0f}){eta}")
-
-            if corner_frac > 0:
-                out_tmp = os.path.join(tmpdir, f"tmp_{arena.idx:02d}.mp4")
-                cmd = [
-                    "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
-                    "-vf", f"crop={w}:{h}:{x}:{y}",
-                    "-c:v", codec, "-crf", str(crf), "-preset", "fast",
-                    "-pix_fmt", "yuv420p", "-an", out_tmp,
-                ]
-                rc, err = _run_ffmpeg_with_progress(cmd, total_frames,
-                                                    label=f"Cropping #{arena.idx:02d}")
-                if rc != 0:
-                    print(f"    Warning: ffmpeg crop failed: {err[-200:]}")
-                    continue
-                print(f"    Applying corner mask...")
-                _postprocess_corner_mask(out_tmp, out_path, w, h, corner_frac)
-            else:
-                cmd = [
-                    "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
-                    "-vf", f"crop={w}:{h}:{x}:{y}",
-                    "-c:v", codec, "-crf", str(crf), "-preset", "fast",
-                    "-pix_fmt", "yuv420p", "-an", out_path,
-                ]
-                rc, err = _run_ffmpeg_with_progress(cmd, total_frames,
-                                                    label=f"Cropping #{arena.idx:02d}")
-                if rc != 0:
-                    print(f"    Warning: ffmpeg error: {err[-200:]}")
-                    continue
-
-            # Report output file size
-            if os.path.exists(out_path):
-                sz = os.path.getsize(out_path)
-                if sz > 1e9:
-                    print(f"    -> {os.path.basename(out_path)} ({sz / 1e9:.1f} GB)")
-                else:
-                    print(f"    -> {os.path.basename(out_path)} ({sz / 1e6:.1f} MB)")
-
-            outputs.append(out_path)
-
-        total_time = time.monotonic() - t_start_all
-        print(f"\n  Total extraction time: {total_time / 60:.1f} min")
-    return outputs
-
-
-def _postprocess_corner_mask(in_path, out_path, crop_w, crop_h, frac):
+def _postprocess_corner_mask(in_path, out_path, crop_w, crop_h, frac, tag=""):
     """Read video, white-out corners frame by frame, re-encode."""
+    import time
     cap = cv2.VideoCapture(in_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, fps, (crop_w, crop_h))
     triangles = corner_mask_triangles(crop_w, crop_h, frac)
-    import time
     count = 0
     last_print = time.monotonic()
     while True:
@@ -725,15 +718,94 @@ def _postprocess_corner_mask(in_path, out_path, crop_w, crop_h, frac):
         writer.write(frame)
         count += 1
         now = time.monotonic()
-        if total > 0 and now - last_print >= 2.0:
+        if total > 0 and now - last_print >= 5.0:
             pct = count * 100 // total
-            print(f"\r    Corner mask {pct:3d}% ({count}/{total})",
-                  end="", flush=True)
+            print(f"    {tag} mask {pct}%", flush=True)
             last_print = now
     cap.release()
     writer.release()
-    if total > 0:
-        print(f"\r    Corner mask 100% ({total}/{total})   ")
+
+
+def concat_and_crop(chunks, arenas, output_dir, recording_name,
+                    codec="libx264", crf=18, frame_height=0, frame_width=0,
+                    keep_full=False, corner_frac=CORNER_MASK, jobs=1):
+    """Concatenate mp4 chunks and crop each arena, with resume + parallelism."""
+    import time
+    from multiprocessing import Pool
+
+    os.makedirs(output_dir, exist_ok=True)
+    outputs = []
+    total_frames = _get_total_frames(chunks)
+
+    # Build concat file in a persistent temp dir (workers need it)
+    tmpdir = tempfile.mkdtemp(prefix="arena_extract_")
+    concat_file = build_concat_file(chunks, tmpdir)
+
+    try:
+        if keep_full:
+            full_path = os.path.join(output_dir, f"{recording_name}_full.mp4")
+            if os.path.exists(full_path) and os.path.getsize(full_path) > 1024:
+                print(f"  Full video exists, skipping: {full_path}")
+            else:
+                print(f"  Concatenating full video -> {full_path}")
+                subprocess.run([
+                    "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                    "-i", concat_file, "-c", "copy", full_path,
+                ], check=True, capture_output=True)
+            outputs.append(full_path)
+
+        # Build task list
+        tasks = []
+        for i, arena in enumerate(arenas):
+            tasks.append({
+                "concat_file": concat_file,
+                "arena_dict": arena.to_dict(),
+                "output_dir": output_dir,
+                "recording_name": recording_name,
+                "codec": codec,
+                "crf": crf,
+                "frame_width": frame_width,
+                "frame_height": frame_height,
+                "corner_frac": corner_frac,
+                "padding": CROP_PADDING,
+                "total_frames": total_frames,
+                "arena_index": i,
+                "n_arenas": len(arenas),
+            })
+
+        t0 = time.monotonic()
+        n = len(tasks)
+
+        if jobs <= 1:
+            # Sequential
+            for task in tasks:
+                result = _extract_single_arena(task)
+                if result:
+                    outputs.append(result)
+        else:
+            # Parallel
+            print(f"  Running {jobs} parallel workers...")
+            with Pool(processes=jobs) as pool:
+                results = pool.map(_extract_single_arena, tasks)
+            for r in results:
+                if r:
+                    outputs.append(r)
+
+        elapsed = time.monotonic() - t0
+        done = sum(1 for t in tasks
+                   if os.path.exists(os.path.join(
+                       output_dir,
+                       f"{recording_name}_arena_{Arena.from_dict(t['arena_dict']).idx:02d}.mp4")))
+        skipped = n - done  # approximate
+        print(f"\n  Total: {elapsed / 60:.1f} min for {n} arenas "
+              f"({jobs} worker{'s' if jobs > 1 else ''})")
+
+    finally:
+        # Clean up concat file
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return outputs
 
 
 # ┌─────────────────────────────────────────────────────────────────────┐
@@ -763,6 +835,9 @@ def parse_args():
                    help="Disable corner white-out.")
     p.add_argument("--keep_full", action="store_true")
     p.add_argument("--no_gui", action="store_true")
+    p.add_argument("-j", "--jobs", type=int, default=1,
+                   help="Parallel workers for extraction (default: 1). "
+                        "2-3 recommended for USB drives, more for SSDs.")
     p.add_argument("--n_proj_frames", type=int, default=N_PROJECTION_FRAMES,
                    help=f"Frames for max-projection (default: {N_PROJECTION_FRAMES}).")
     return p.parse_args()
@@ -853,12 +928,13 @@ def main():
         }, f, indent=2)
     print(f"\n  Arena positions saved -> {json_out}")
 
-    print(f"\n  Extracting ({len(arenas)} arenas x {len(chunks)} chunks)...")
+    print(f"\n  Extracting ({len(arenas)} arenas x {len(chunks)} chunks, "
+          f"{args.jobs} worker{'s' if args.jobs > 1 else ''})...")
     outputs = concat_and_crop(
         chunks=chunks, arenas=arenas, output_dir=output_dir,
         recording_name=recording_name, codec=args.codec, crf=args.crf,
         frame_height=frame_h, frame_width=frame_w,
-        keep_full=args.keep_full, corner_frac=CORNER_MASK,
+        keep_full=args.keep_full, corner_frac=CORNER_MASK, jobs=args.jobs,
     )
     print(f"\n  Done! {len(outputs)} files written to {output_dir}")
     for p in outputs:
