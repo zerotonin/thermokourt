@@ -1,3 +1,4 @@
 thermokourt/__pycache__/
 *.pyc
 thermokourt.egg-info/
+*.log
