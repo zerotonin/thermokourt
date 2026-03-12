@@ -44,7 +44,7 @@ import numpy as np
 # └─────────────────────────────────────────────────────────────────────┘
 DEFAULT_N_ARENAS = 10
 CROP_PADDING = 0.10       # 10 % padding around arena circle
-CORNER_MASK = 0.05        # 5 % of crop side length for corner triangles
+CORNER_MASK = 0.25        # 25 % of crop side length for corner triangles
 RADIUS_TOLERANCE = 0.25   # reject circles with radius ± 25 % of median
 MIN_ARENAS_FOR_FILTER = 5
 N_PROJECTION_FRAMES = 10  # frames sampled for max-projection
@@ -300,7 +300,7 @@ class ArenaEditorCV2:
         self.rec_name = recording_name
         self.json_path = json_path
         self.show_corners = True
-        self.show_help = False
+        self.show_help = True  # start with help visible
         self.accepted = False
 
         # Display: render at full res, let OpenCV window handle scaling
@@ -346,7 +346,6 @@ class ArenaEditorCV2:
         font_scale = max(0.6, 0.8 * S)
         font_thick = max(2, int(2.5 * S))
         label_pad = max(4, int(6 * S))
-        status_font = max(0.6, 0.7 * S)
 
         for a in self.arenas:
             col = COLOURS_BGR[a.idx % len(COLOURS_BGR)]
@@ -399,48 +398,34 @@ class ArenaEditorCV2:
             cv2.putText(vis, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX,
                         font_scale, (255, 255, 255), font_thick)
 
-        # Status bar at top
-        status = (f"{self.rec_name}  |  {len(self.arenas)} arenas  |  "
-                  f"F1=help  Q=accept")
-        # Dark background for readability
-        (sw, sh), _ = cv2.getTextSize(status, cv2.FONT_HERSHEY_SIMPLEX,
-                                      status_font, font_thick)
-        cv2.rectangle(vis, (0, 0), (sw + 20, sh + int(20 * S)),
-                      (0, 0, 0), -1)
-        cv2.putText(vis, status, (10, sh + int(10 * S)),
-                    cv2.FONT_HERSHEY_SIMPLEX, status_font,
-                    (255, 255, 255), font_thick)
-
-        # F1 Help overlay
+        # Help / info overlay — positioned bottom-right to not block arenas
+        # When hidden, just a small "F1=help" hint in the corner
         if self.show_help:
             help_lines = [
-                "ARENA EXTRACTOR — CONTROLS",
+                f"{self.rec_name}",
+                f"{len(self.arenas)} arenas  |  {fw} x {fh} px",
                 "",
                 "MOUSE",
-                "  Left-drag centre dot    Move arena",
-                "  Left-drag rim diamond   Resize arena",
-                "  Right-click empty       Add new arena",
-                "  Right-click on centre   Delete arena",
+                "  Drag centre dot     Move arena",
+                "  Drag rim diamond    Resize arena",
+                "  Right-click empty   Add new arena",
+                "  Right-click centre  Delete arena",
                 "",
-                "KEYBOARD",
-                "  A          Re-run auto-detection",
-                "  + / =      Increase all radii by 5px",
-                "  -          Decrease all radii by 5px",
-                "  U          Set all radii to median",
-                "  C          Toggle corner mask preview",
-                "  S          Save arena positions to JSON",
-                "  F1 / H     Toggle this help",
-                "  Q / Enter  Accept and start extraction",
-                "  Escape     Abort (no extraction)",
-                "",
-                f"  Arenas: {len(self.arenas)}    "
-                f"Frame: {fw} x {fh} px",
+                "KEYS",
+                "  A     Re-run auto-detection",
+                "  +/-   Adjust all radii",
+                "  U     Uniform radii (median)",
+                "  C     Toggle corner mask lines",
+                "  S     Save positions to JSON",
+                "  F1/H  Toggle this panel",
+                "  Q     Accept & extract",
+                "  Esc   Abort",
             ]
-            help_font = max(0.5, 0.6 * S)
+            help_font = max(0.5, 0.55 * S)
             help_thick = max(1, int(1.5 * S))
-            line_h = int(25 * S)
-            pad = int(15 * S)
-            # Measure help box size
+            line_h = int(22 * S)
+            pad = int(12 * S)
+
             max_tw = 0
             for ln in help_lines:
                 (tw2, _), _ = cv2.getTextSize(ln, cv2.FONT_HERSHEY_SIMPLEX,
@@ -448,9 +433,11 @@ class ArenaEditorCV2:
                 max_tw = max(max_tw, tw2)
             box_w = max_tw + 3 * pad
             box_h = len(help_lines) * line_h + 2 * pad
-            x0 = int(20 * S)
-            y0 = int(50 * S)
-            # Semi-transparent background
+
+            # Bottom-right corner
+            x0 = fw - box_w - int(10 * S)
+            y0 = fh - box_h - int(10 * S)
+
             overlay_help = vis.copy()
             cv2.rectangle(overlay_help, (x0, y0), (x0 + box_w, y0 + box_h),
                           (0, 0, 0), -1)
@@ -458,12 +445,29 @@ class ArenaEditorCV2:
                           (0, 200, 100), max(1, int(S)))
             cv2.addWeighted(overlay_help, 0.85, vis, 0.15, 0, vis)
             for j, ln in enumerate(help_lines):
-                col_txt = (0, 255, 136) if j == 0 else (220, 220, 220)
+                if j == 0:
+                    col_txt = (0, 255, 136)  # title green
+                elif j == 1:
+                    col_txt = (180, 180, 180)  # info gray
+                else:
+                    col_txt = (220, 220, 220)
                 cv2.putText(vis, ln, (x0 + pad, y0 + pad + (j + 1) * line_h),
                             cv2.FONT_HERSHEY_SIMPLEX, help_font, col_txt,
                             help_thick)
+        else:
+            # Minimal hint when help is hidden — bottom-right, small
+            hint = "F1=help  Q=accept"
+            hint_font = max(0.4, 0.5 * S)
+            hint_thick = max(1, int(1.5 * S))
+            (hw, hh), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX,
+                                          hint_font, hint_thick)
+            hx = fw - hw - int(15 * S)
+            hy = fh - int(15 * S)
+            cv2.rectangle(vis, (hx - 6, hy - hh - 6), (hx + hw + 6, hy + 6),
+                          (0, 0, 0), -1)
+            cv2.putText(vis, hint, (hx, hy), cv2.FONT_HERSHEY_SIMPLEX,
+                        hint_font, (200, 200, 200), hint_thick)
 
-        # WINDOW_NORMAL handles display scaling — show at full resolution
         cv2.imshow(self.WIN, vis)
 
     # ── hit testing ──────────────────────────────────────────────────
