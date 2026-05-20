@@ -11,12 +11,23 @@ from thermokourt.extract.arena_extractor import (
 
 class TestArena:
     def test_bbox(self):
+        # Use padding=0.0 so the bbox is the raw circle bounding box;
+        # the default CROP_PADDING is exercised in test_bbox_with_padding.
         a = Arena(cx=100.0, cy=100.0, r=50.0, idx=0)
-        x, y, w, h = a.bbox()
+        x, y, w, h = a.bbox(padding=0.0)
         assert x == 50
         assert y == 50
         assert w == 100
         assert h == 100
+
+    def test_bbox_with_padding(self):
+        # Default padding adds CROP_PADDING * r to each side.
+        a = Arena(cx=100.0, cy=100.0, r=50.0, idx=0)
+        x, y, w, h = a.bbox()
+        # Symmetric padding, even-sized result.
+        assert w == h
+        assert w >= 100
+        assert w % 2 == 0
 
     def test_bbox_clamps_negative(self):
         a = Arena(cx=10.0, cy=10.0, r=50.0, idx=0)
