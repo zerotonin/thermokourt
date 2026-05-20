@@ -64,10 +64,13 @@ exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
 # -- Options for HTML output -------------------------------------------------
 html_theme = "furo"
-html_title = "ThermoKourt"
+html_title = f"ThermoKourt {release}"
+html_short_title = "ThermoKourt"
 html_static_path = []
 html_theme_options = {
     "source_repository": "https://github.com/zerotonin/thermokourt",
     "source_branch": "main",
     "source_directory": "docs/",
+    "navigation_with_keys": True,
+    "top_of_page_buttons": ["view", "edit"],
 }

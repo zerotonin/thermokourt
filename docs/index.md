@@ -1,23 +1,50 @@
 # ThermoKourt Documentation
 
-**A modular pipeline for analysing *Drosophila* courtship and aggression under thermal manipulation.**
+**A modular pipeline for analysing *Drosophila* courtship and aggression
+under thermal manipulation.**
 
 ```{toctree}
 :maxdepth: 2
-:caption: Contents
+:caption: User guide
 
 getting_started
 pipeline
 architecture
-api
+```
+
+```{toctree}
+:maxdepth: 2
+:caption: Development
+
+development/contributing
+development/ci_cd
+development/release_process
+```
+
+```{toctree}
+:maxdepth: 2
+:caption: API reference
+
+api/extract
+api/track
+api/overlay
+api/score
+api/utils
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: Project
+
+changelog
 ```
 
 ## Overview
 
-ThermoKourt chains together arena extraction, identity tracking, manual ethogram
-annotation, and automated behavioural classification into a single reproducible
-pipeline. See the {doc}`architecture` document for design rationale and the
-{doc}`pipeline` guide for step-by-step usage.
+ThermoKourt chains together arena extraction, identity tracking, manual
+ethogram annotation, and automated behavioural classification into a single
+reproducible pipeline. See the {doc}`architecture` document for design
+rationale and the {doc}`pipeline` guide for step-by-step usage.
 
 ## Quick links
 
