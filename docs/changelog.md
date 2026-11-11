@@ -6,7 +6,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Fixed
+
+- `sleap_submit.sh` no longer sends TF (SLEAP 1.4.1) runs to the H100: TF 2.7
+  has no sm_90 kernels, so each H100 worker spent ~14 min JIT-compiling from
+  PTX and finished its arena 10-15x later than the other cards, holding up the
+  whole run. sleap-nn models still use it.
+- `sleap_nn_train.sh` no longer hands the first validation set to sleap-nn as
+  `--val`: those frames chose the checkpoint and then scored it. sleap-nn now
+  picks checkpoints on 10 % of the training frames; validation sets only score.
+- `sleap_worker.sh` keeps the log of every failed try as
+  `arena_NN.strikeK.log`; the retry used to overwrite the only copy.
+
 ### Added
+
+- The arenas JSON written with the clips now keeps everything needed to map
+  poses back onto the original camera frame: `video_crop` (Rig Conductor's
+  crop of the recording, from `reduced.json`), `min_size`, and per arena the
+  exact `clip` box `[x, y, w, h]` in camera pixels (clip pixel (u, v) = camera
+  (u + x, v + y)). `arena_extractor.clip_to_camera()` does the mapping.
+  Detected layouts on a cropped recording are now also saved in camera
+  coordinates.
+
+- SLEAP 1.6 (sleap-nn, PyTorch) on Aoraki: `sleap_track.sh` picks the back end
+  per model (`SLEAP_BACKEND=auto|tf|nn`; auto = sleap-nn when the model has a
+  `best.ckpt`). sleap-nn also runs the old TF UNet models (same poses within
+  0.9 px). The analysis `.h5` keeps the layout `posttrack` reads.
+- `scripts/slurm/sleap_nn_train.sh`: fine-tunes a top-down pair from an existing
+  model (TF `.h5` or sleap-nn `.ckpt`), then scores new and current model on every
+  validation set into `models/<run>.eval.json`; `<run>.done` / `.failed` markers.
+- `scripts/sleap/nn_config.py` (training YAML from a model's config; crop size
+  from the largest labelled fly, 0.8–1.25× zoom augmentation) and
+  `scripts/sleap/nn_eval.py` (mAP, mOKS, distances as JSON).
 
 - `extract.arena_detect`: new detector combining intensity blobs (radius
   octave scan, both polarities), Hough seeds, and disc template matching

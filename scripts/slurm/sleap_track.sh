@@ -19,6 +19,10 @@
 # Inputs : $PROJ/clips/<trial_id>/<trial_id>_arena_NN.mp4   (NN = array index)
 #          $PROJ/models/<run_name>.centroid, <run_name>.centered_instance
 # Outputs: $PROJ/pose/<trial_id>/<trial_id>_arena_NN.slp  and  .h5 (analysis export)
+#
+# Back end: SLEAP_BACKEND=tf (SLEAP 1.4.1 conda env), nn (SLEAP 1.6 / sleap-nn,
+# PyTorch, uv env in $NN_ENV) or auto (default): nn when the model has a sleap-nn
+# checkpoint (best.ckpt), else tf. sleap-nn also runs the old TF (UNet) models.
 set -euo pipefail
 
 PROJ="${PROJ:-/projects/sciences/zoology/geurten_lab/HeatAggression}"
@@ -36,22 +40,41 @@ CLIP="$PROJ/clips/$TRIAL/${TRIAL}_arena_${IDX}.mp4"
 OUT_DIR="$PROJ/pose/$TRIAL"
 OUT="$OUT_DIR/${TRIAL}_arena_${IDX}.slp"
 
-# The env's activate hook appends to LD_LIBRARY_PATH, which is unset on
-# compute nodes and trips `set -u`; define it first.
-export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
-# TensorFlow grabs the whole GPU by default; with growth on, several clips can
-# share one card (sleap_worker.sh packs 3-5 per GPU).
-export TF_FORCE_GPU_ALLOW_GROWTH=true
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate "${SLEAP_ENV:-sleap}"
-# The sleap-* console scripts fail on this env (pkg_resources cannot resolve
-# setuptools for pynwb); the module entry points work, so use python -m.
+BACKEND="${SLEAP_BACKEND:-auto}"
+NN_ENV="${NN_ENV:-$PROJ/envs/uv-tools/sleap}"
+if [ "$BACKEND" = "auto" ]; then
+  if [ -f "$PROJ/models/$RUN.centroid/best.ckpt" ]; then BACKEND=nn; else BACKEND=tf; fi
+fi
+
+if [ "$BACKEND" = "nn" ]; then
+  PY="$NN_ENV/bin/python"
+  [ -x "$PY" ] || { echo "sleap-nn env missing: $NN_ENV"; exit 2; }
+  # No conda env here, so no ffmpeg on PATH: use the one imageio-ffmpeg ships.
+  if ! command -v ffmpeg >/dev/null; then
+    FF_BIN="$("$PY" -c 'import imageio_ffmpeg as f; print(f.get_ffmpeg_exe())')"
+    mkdir -p "${SLURM_TMPDIR:-/tmp}/ffbin_$$"
+    ln -sf "$FF_BIN" "${SLURM_TMPDIR:-/tmp}/ffbin_$$/ffmpeg"
+    export PATH="${SLURM_TMPDIR:-/tmp}/ffbin_$$:$PATH"
+  fi
+else
+  # The env's activate hook appends to LD_LIBRARY_PATH, which is unset on
+  # compute nodes and trips `set -u`; define it first.
+  export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+  # TensorFlow grabs the whole GPU by default; with growth on, several clips can
+  # share one card (sleap_worker.sh packs 3-5 per GPU).
+  export TF_FORCE_GPU_ALLOW_GROWTH=true
+  source ~/miniconda3/etc/profile.d/conda.sh
+  conda activate "${SLEAP_ENV:-sleap}"
+  # The sleap-* console scripts fail on this env (pkg_resources cannot resolve
+  # setuptools for pynwb); the module entry points work, so use python -m.
+  PY=python
+fi
 
 echo "=== SLEAP tracking ==="
 echo "Job   : $SLURM_JOB_ID[$IDX] on $SLURMD_NODENAME"
 echo "GPU   : $(nvidia-smi --query-gpu=name --format=csv,noheader)"
 echo "Clip  : $CLIP"
-echo "Model : $RUN"
+echo "Model : $RUN  (backend $BACKEND)"
 echo "Start : $(date -Is)"
 echo "======================"
 
@@ -75,6 +98,24 @@ FRAME_ARGS=()
 [ -n "$FRAMES" ] && FRAME_ARGS=(--frames "$FRAMES")
 
 t0=$(date +%s)
+if [ "$BACKEND" = "nn" ]; then
+  "$NN_ENV/bin/sleap-nn" track -i "$LOCAL" \
+    -m "$PROJ/models/$RUN.centroid" \
+    -m "$PROJ/models/$RUN.centered_instance" \
+    --tracking \
+    --candidates_method local_queues \
+    --features centroids \
+    --scoring_method euclidean_dist \
+    --track_matching_method hungarian \
+    --tracking_window_size 5 \
+    --tracking_target_instance_count "$N_ANIMALS" \
+    --max_tracks "$N_ANIMALS" \
+    --post_connect_single_breaks \
+    --max_instances "$N_ANIMALS" \
+    --batch_size 16 \
+    "${FRAME_ARGS[@]}" \
+    -o "$OUT"
+else
 # `python -m sleap.nn.inference` imports but never runs main() in 1.4.1; call it.
 python -c "import sys; from sleap.nn.inference import main; main(sys.argv[1:])" "$LOCAL" \
   -m "$PROJ/models/$RUN.centroid" \
@@ -91,12 +132,17 @@ python -c "import sys; from sleap.nn.inference import main; main(sys.argv[1:])" 
   --batch_size 16 \
   "${FRAME_ARGS[@]}" \
   -o "$OUT"
+fi
 echo "inference+tracking: $(( $(date +%s) - t0 )) s"
 
 # An arena without animals gives a .slp with no instances (and no skeleton), on
 # which the analysis export crashes. Record it as empty instead of failing.
 # sleap's imports log to stdout, so only the last line is the count.
-N_INST=$(python -c "import sys, sleap; l = sleap.load_file(sys.argv[1]); print(sum(len(f.instances) for f in l))" "$OUT" 2>/dev/null | tail -n 1)
+if [ "$BACKEND" = "nn" ]; then
+  N_INST=$("$PY" -c "import sys, sleap_io as sio; l = sio.load_slp(sys.argv[1]); print(sum(len(f.instances) for f in l))" "$OUT" 2>/dev/null | tail -n 1)
+else
+  N_INST=$(python -c "import sys, sleap; l = sleap.load_file(sys.argv[1]); print(sum(len(f.instances) for f in l))" "$OUT" 2>/dev/null | tail -n 1)
+fi
 echo "instances found: $N_INST"
 if [ "$N_INST" = "0" ]; then
   echo "no animals found in this clip" > "${OUT%.slp}.empty"
@@ -108,7 +154,11 @@ fi
 rm -f "${OUT%.slp}.empty"
 
 # Analysis HDF5 (tracks, node names, scores) for thermokourt.posttrack
-python -m sleap.io.convert --format analysis -o "${OUT%.slp}.h5" "$OUT"
+if [ "$BACKEND" = "nn" ]; then
+  "$PY" -c "import sys, sleap_io as sio; sio.save_analysis_h5(sio.load_slp(sys.argv[1]), sys.argv[2])" "$OUT" "${OUT%.slp}.h5"
+else
+  python -m sleap.io.convert --format analysis -o "${OUT%.slp}.h5" "$OUT"
+fi
 rm -rf "$SCR"
 
 echo "End   : $(date -Is)"
