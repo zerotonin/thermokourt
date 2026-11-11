@@ -13,15 +13,23 @@
 # Prints  JOBS=<id>,<id>,...  as its last line.
 # Env:    PARTS (space separated), MAX_PER_PART (2), SLOTS (auto per card),
 #         N_ANIMALS / INVERT / PREPROC / FRAMES passed through to sleap_track.sh.
-# RTX6000 (Blackwell, sm_120) and H200 are left out: the sleap env is TF 2.7 /
-# CUDA 11.2 (kernels up to compute_80); smoke-test before adding them.
+# The TF back end (SLEAP 1.4.1: TF 2.7 / CUDA 11.2, kernels up to compute_80)
+# leaves out the H100 (sm_90): it JIT-compiles every kernel from PTX first,
+# ~14 min per worker, then predicts no faster than an A100. sleap-nn models
+# (models/<run>.centroid/best.ckpt, PyTorch cu128) do use it.
+# RTX6000 (Blackwell, sm_120) and H200 are left out; smoke-test before adding.
 set -uo pipefail
 
 PROJ="${PROJ:-/projects/sciences/zoology/geurten_lab/HeatAggression}"
 TRIAL="${1:?Usage: sleap_submit.sh <trial_id> <run_name> <idx,idx,...>}"
 RUN="${2:?run_name missing}"
 IDXS="${3:?arena indices missing}"
-PARTS="${PARTS:-aoraki_gpu_L40 aoraki_gpu_L4_24GB aoraki_gpu_RTX3090 aoraki_gpu_A100_40GB aoraki_gpu_A100_80GB aoraki_gpu_H100}"
+TF_PARTS="aoraki_gpu_L40 aoraki_gpu_L4_24GB aoraki_gpu_RTX3090 aoraki_gpu_A100_40GB aoraki_gpu_A100_80GB"
+if [ -f "$PROJ/models/$RUN.centroid/best.ckpt" ]; then
+  PARTS="${PARTS:-$TF_PARTS aoraki_gpu_H100}"
+else
+  PARTS="${PARTS:-$TF_PARTS}"
+fi
 MAX_PER_PART="${MAX_PER_PART:-2}"
 MIN_SLOTS=3
 TIME="${TIME:-04:00:00}"

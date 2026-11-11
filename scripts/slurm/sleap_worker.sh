@@ -18,6 +18,7 @@
 #   claim_NN/         atomic mkdir = arena NN taken; owner file, heartbeat mtime
 #   strikes_NN        failures so far; parked_NN after MAX_STRIKES
 #   arena_NN.log      sleap_track.sh output for that arena
+#   arena_NN.strikeK.log  kept copy of the K-th failed try
 # Done = <trial>_arena_NN.h5 or .empty exists in $PROJ/pose/<trial>/.
 #
 # Usage (normally via sleap_submit.sh):
@@ -87,7 +88,8 @@ run_clip() {
   else
     local n=$(( $(cat "$Q/strikes_$idx" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$Q/strikes_$idx"
-    echo "arena $idx: FAILED (rc $rc, strike $n/$MAX_STRIKES), see $Q/arena_$idx.log"
+    cp "$Q/arena_$idx.log" "$Q/arena_$idx.strike$n.log"     # a retry overwrites arena_NN.log
+    echo "arena $idx: FAILED (rc $rc, strike $n/$MAX_STRIKES), see $Q/arena_$idx.strike$n.log"
     [ "$n" -ge "$MAX_STRIKES" ] && touch "$Q/parked_$idx"
   fi
   rm -rf "$Q/claim_$idx"
