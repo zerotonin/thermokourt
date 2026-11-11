@@ -13,10 +13,30 @@ circular arena into an individual video file.
 
 ### Arena detection
 
-The first frame is analysed with a Hough Circle Transform. The detector sweeps
-accumulator thresholds from strict to loose until it finds the expected number
-of arenas (default: 10). It tries OpenCV first and falls back to
-scikit-image if OpenCV is not installed.
+Detection runs on a max-projection (fly bodies move, so the per-pixel maximum
+is the empty plate) and combines three cues:
+
+1. **Blobs** — round patches brighter or darker than the local background,
+   scanned over radius octaves. These give the radius estimate.
+2. **Hough circles** — edge-based fallback when fewer than three blobs are
+   found (e.g. arenas that are only slightly greyer than the backlight).
+3. **Template matching** — a disc of the estimated radius is correlated with
+   the image and the best `n_arenas` non-overlapping positions are kept. The
+   search is limited to the convex hull of the seeds plus three radii, so
+   lamps, screws and lids outside the plate are ignored.
+
+Options when the defaults miss:
+
+| Option | Use when |
+|---|---|
+| `--roi X,Y,W,H` | Bright objects (light pad, lid) are in view — give the plate rectangle in pixels. |
+| `--min_r N --max_r N` | Arenas are unusually small or large (default window 3–20 % of the short side). |
+| `--polarity bright\|dark` | Auto-detection picks the wrong contrast. |
+| `--detect_only` | Set up a new rig: verify in the GUI, save the JSON and preview PNG, extract later. |
+
+On a fixed rig the arena positions do not change between recordings: run
+detection once, verify, and reuse the JSON with `--arenas` for every
+subsequent recording (see below).
 
 ### Interactive editor
 
