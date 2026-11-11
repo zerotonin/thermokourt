@@ -996,6 +996,68 @@ def reduced_offset(arenas_path, recording_dir, video_w, video_h):
     return int(r["x"]), int(r["y"]), int(r["full_width"]), int(r["full_height"])
 
 
+def video_crop(recording_dir, video_w, video_h):
+    """Rig Conductor's crop of this recording's video (reduced.json) as
+    {x, y, w, h, full_width, full_height}, or None for an uncropped video."""
+    red = Path(recording_dir) / "reduced.json"
+    if not red.is_file():
+        return None
+    r = json.loads(red.read_text(encoding="utf-8"))
+    if (video_w, video_h) != (r["w"], r["h"]):
+        return None
+    keys = ("x", "y", "w", "h", "full_width", "full_height")
+    return {k: int(r[k]) for k in keys}
+
+
+def clip_boxes(arenas, frame_w, frame_h, offset=(0, 0)):
+    """The exact box each clip is cut with, in full camera pixels:
+    {idx: [x, y, w, h]}. Clip pixel (u, v) is camera pixel (u + x, v + y)."""
+    ox, oy = offset
+    out = {}
+    for a in arenas:
+        x, y, w, h = a.bbox(padding=CROP_PADDING, frame_w=frame_w, frame_h=frame_h,
+                            min_size=MIN_CLIP_SIZE)
+        out[a.idx] = [x + ox, y + oy, w, h]
+    return out
+
+
+def clip_to_camera(points, arenas_json, idx):
+    """Points (..., 2) in clip pixels of arena ``idx`` → full camera pixels,
+    using the clip box saved in the arenas JSON."""
+    d = json.loads(Path(arenas_json).read_text(encoding="utf-8"))
+    entry = next(a for a in d["arenas"] if a.get("idx") == idx)
+    if "clip" not in entry:
+        raise ValueError(f"{arenas_json}: arena {idx} has no saved clip box (cut before v1.3)")
+    x, y = entry["clip"][:2]
+    return np.asarray(points, dtype=float) + (x, y)
+
+
+def layout_record(recording_name, arenas, frame_w, frame_h, recording_dir):
+    """The arenas JSON for clips cut from a ``frame_w`` × ``frame_h`` video.
+
+    Positions are saved in full camera coordinates even for a cropped recording,
+    so layouts, the database and re-cuts all share one coordinate system. The
+    crop of the video and the exact box of every clip are kept too: together
+    they map poses in a clip back onto the original camera frame.
+    """
+    crop = video_crop(recording_dir, frame_w, frame_h)
+    saved, full_w, full_h, extra = arenas, frame_w, frame_h, {}
+    if crop:
+        ox, oy, full_w, full_h = crop["x"], crop["y"], crop["full_width"], crop["full_height"]
+        saved = shift_arenas(arenas, ox, oy)
+        extra = {"video_offset": [ox, oy], "video_crop": crop}
+    boxes = clip_boxes(arenas, frame_w, frame_h, extra.get("video_offset", (0, 0)))
+    return {
+        "recording": recording_name,
+        "frame_width": full_w, "frame_height": full_h,
+        "padding": CROP_PADDING, "corner_mask": CORNER_MASK,
+        "min_size": MIN_CLIP_SIZE,
+        "clip_box": "x, y, w, h in camera px; clip (u, v) = camera (u + x, v + y)",
+        **extra,
+        "arenas": [{**a.to_dict(), "clip": boxes[a.idx]} for a in saved],
+    }
+
+
 def shift_arenas(arenas, dx, dy):
     """Copies of ``arenas`` moved by (dx, dy), indices kept."""
     return [Arena(cx=a.cx + dx, cy=a.cy + dy, r=a.r, idx=a.idx) for a in arenas]
@@ -1035,12 +1097,11 @@ def main():
     output_dir = args.output_dir or recording_dir
 
     print("+" + "-" * 44 + "+")
-    print("|  ARENA EXTRACTOR v1.2                      |")
+    print("|  ARENA EXTRACTOR v1.3                      |")
     print("|  detect. adjust. stitch. crop.             |")
     print("+" + "-" * 44 + "+")
 
     chunks = get_mp4_chunks(recording_dir)
-    layout_offset = None
     print(f"  Recording: {recording_name}")
     print(f"  Chunks:    {len(chunks)} .mp4 files")
     print(f"  Output:    {output_dir}")
@@ -1050,7 +1111,6 @@ def main():
         print(f"  Loaded {len(arenas)} arenas from {args.arenas}")
         # Still need a frame for display
         w, h, dur, fps = _probe(chunks[0])
-        layout_offset = reduced_offset(args.arenas, recording_dir, w, h)
         arenas = shift_for_reduced(arenas, args.arenas, recording_dir, w, h)
         proj = extract_frame_at(chunks[-1], dur * 0.9 if dur > 0 else 0, w, h)
         if proj is None:
@@ -1094,21 +1154,9 @@ def main():
     except PermissionError:
         _die(f"Cannot create output directory '{output_dir}' — permission denied.\n"
              f"       Try a path you own, e.g.  -o ~/results/")
-    # Positions are saved in full camera coordinates even for a cropped recording,
-    # so layouts, the database and re-cuts all share one coordinate system.
-    saved, full_w, full_h, extra = arenas, frame_w, frame_h, {}
-    if layout_offset:
-        ox, oy, full_w, full_h = layout_offset
-        saved = shift_arenas(arenas, ox, oy)
-        extra = {"video_offset": [ox, oy]}
     with open(json_out, "w", encoding="utf-8") as f:
-        json.dump({
-            "recording": recording_name,
-            "frame_width": full_w, "frame_height": full_h,
-            "padding": CROP_PADDING, "corner_mask": CORNER_MASK,
-            **extra,
-            "arenas": [a.to_dict() for a in saved],
-        }, f, indent=2)
+        json.dump(layout_record(recording_name, arenas, frame_w, frame_h, recording_dir),
+                  f, indent=2)
     print(f"\n  Arena positions saved -> {json_out}")
     preview = os.path.join(output_dir, f"{recording_name}_arenas.png")
     save_arena_preview(proj, arenas, preview)

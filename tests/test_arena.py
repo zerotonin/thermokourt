@@ -154,3 +154,42 @@ def test_clip_frame_check(tmp_path):
     check_clip_frames([str(good)], [str(c) for c in chunks])
     with pytest.raises(RuntimeError, match="short.mp4 has 12"):
         check_clip_frames([str(good), str(short)], [str(c) for c in chunks])
+
+
+def test_clip_boxes_map_clip_pixels_back_to_the_camera(tmp_path):
+    """Full frame → Conductor crop (reduced.json) → arena clip → back again."""
+    import numpy as np
+
+    from thermokourt.extract.arena_extractor import Arena, clip_to_camera, layout_record
+
+    full = np.zeros((2160, 2600), np.uint8)
+    full[1000, 1500] = 255                       # one marked pixel in the camera frame
+    x, y, w, h = 784, 830, 944, 976
+    (tmp_path / "reduced.json").write_text(json.dumps(
+        {"x": x, "y": y, "w": w, "h": h, "full_width": 2600, "full_height": 2160}))
+    video = full[y:y + h, x:x + w]               # the reduced recording
+    arena = Arena(cx=1500 - x + 3.4, cy=1000 - y - 7.8, r=151.3, idx=4)
+    bx, by, bw, bh = arena.bbox(padding=0.1, frame_w=w, frame_h=h)
+    clip = video[by:by + bh, bx:bx + bw]          # what ffmpeg crop=bw:bh:bx:by cuts
+    v, u = np.argwhere(clip == 255)[0]
+
+    rec = layout_record("r", [arena], w, h, tmp_path)
+    assert rec["video_crop"]["x"] == x and rec["frame_width"] == 2600
+    (entry,) = rec["arenas"]
+    assert entry["clip"][2:] == [bw, bh]
+    lay = tmp_path / "r_arenas.json"
+    lay.write_text(json.dumps(rec))
+    assert clip_to_camera([u, v], lay, 4).tolist() == [1500, 1000]
+
+
+def test_uncropped_video_has_no_crop_and_old_layouts_say_so(tmp_path):
+    from thermokourt.extract.arena_extractor import Arena, clip_to_camera, layout_record
+
+    rec = layout_record("r", [Arena(cx=500, cy=400, r=150, idx=0)], 2600, 2160, tmp_path)
+    assert "video_crop" not in rec and rec["arenas"][0]["clip"][:2] == [335, 235]
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"arenas": [{"cx": 500, "cy": 400, "r": 150, "idx": 0}]}))
+    import pytest
+
+    with pytest.raises(ValueError, match="no saved clip box"):
+        clip_to_camera([0, 0], old, 0)
