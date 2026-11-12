@@ -61,6 +61,8 @@ all = ["thermokourt[track,score,dev]"]
 thermokourt-extract = "thermokourt.extract.arena_extractor:main"
 thermokourt-track = "thermokourt.track.cli:main"
 thermokourt-overlay = "thermokourt.overlay.cli:main"
+thermokourt-db = "thermokourt.db.cli:main"
+thermokourt-trial = "thermokourt.trial.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/zerotonin/thermokourt"
@@ -70,6 +72,9 @@ Issues = "https://github.com/zerotonin/thermokourt/issues"
 
 [tool.setuptools.packages.find]
 include = ["thermokourt*"]
+
+[tool.setuptools.package-data]
+"thermokourt.db" = ["schema.sql"]
 
 [tool.ruff]
 target-version = "py310"

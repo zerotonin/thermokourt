@@ -39,16 +39,20 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
+from thermokourt.extract import arena_detect
+
 # ┌─────────────────────────────────────────────────────────────────────┐
 # │  CONSTANTS                                                          │
 # └─────────────────────────────────────────────────────────────────────┘
 DEFAULT_N_ARENAS = 10
 CROP_PADDING = 0.10       # 10 % padding around arena circle
 CORNER_MASK = 0.25        # 25 % of crop side length for corner triangles
+MIN_CLIP_SIZE = 0         # px; clips are grown to at least this side (0 = off)
 RADIUS_TOLERANCE = 0.25   # reject circles with radius ± 25 % of median
 MIN_ARENAS_FOR_FILTER = 5
 N_PROJECTION_FRAMES = 10  # frames sampled for max-projection
 PROJECTION_START = 0.25   # start at 25 % of total duration
+SHORT_RECORDING_S = 120   # below this, project the whole clip densely
 
 
 # ┌─────────────────────────────────────────────────────────────────────┐
@@ -62,9 +66,11 @@ class Arena:
     idx: int = 0
 
     def bbox(self, padding: float = CROP_PADDING,
-             frame_w: int = 0, frame_h: int = 0) -> Tuple[int, int, int, int]:
-        """(x, y, w, h) with padding, clamped to frame, even dimensions."""
-        pr = self.r * (1.0 + padding)
+             frame_w: int = 0, frame_h: int = 0,
+             min_size: int = 0) -> Tuple[int, int, int, int]:
+        """(x, y, w, h) with padding, at least ``min_size`` px a side (pose
+        models need room for one instance crop), clamped to frame, even."""
+        pr = max(self.r * (1.0 + padding), (min_size + 1) / 2.0)
         x, y = int(self.cx - pr), int(self.cy - pr)
         w = h = int(2 * pr)
         if x < 0: w += x; x = 0
@@ -113,9 +119,46 @@ def filter_by_radius(arenas, tol=RADIUS_TOLERANCE, keep=MIN_ARENAS_FOR_FILTER):
 # │  VIDEO I/O helpers                                                  │
 # └─────────────────────────────────────────────────────────────────────┘
 def get_mp4_chunks(d):
-    c = sorted(glob.glob(os.path.join(d, "*.mp4")))
-    if not c: raise FileNotFoundError(f"No .mp4 in {d}")
+    """Motif's chunks (``000000.mp4``, ``000001.mp4``, …) in order. Other mp4s in
+    the folder (a crop's temporary file, an export) are not part of the store.
+    A folder without Motif chunks falls back to all its mp4s."""
+    folder = Path(d)
+    c = sorted(str(p) for p in folder.glob("[0-9]" * 6 + ".mp4"))
+    if not c:
+        c = sorted(str(p) for p in folder.glob("*.mp4"))
+    if not c:
+        raise FileNotFoundError(f"No .mp4 in {d}")
     return c
+
+
+def video_frames(path, exact=False):
+    """Frame count of a video: the mp4 header's ``nb_frames`` (instant), or with
+    ``exact`` (or no header value) by counting packets (reads the whole file)."""
+    entry = "nb_read_packets" if exact else "nb_frames"
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+           f"stream={entry}", "-of", "csv=p=0", str(path)]
+    if exact:
+        cmd.insert(5, "-count_packets")
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    value = r.stdout.strip()
+    if value.isdigit():
+        return int(value)
+    if not exact:
+        return video_frames(path, exact=True)
+    raise RuntimeError(f"cannot count frames in {path}: {r.stderr.strip()[-200:]}")
+
+
+def check_clip_frames(clips, chunks):
+    """Every clip must hold every frame of all chunks joined; raise otherwise."""
+    expected = sum(video_frames(c) for c in chunks)
+    bad = [(Path(c).name, n) for c in clips if (n := video_frames(c, exact=True)) != expected]
+    if bad:
+        listing = ", ".join(f"{name} has {n}" for name, n in bad[:4])
+        raise RuntimeError(
+            f"clips are incomplete: the {len(chunks)} chunk(s) hold {expected} frames but "
+            f"{listing}. Delete the clips and cut again."
+        )
+    print(f"  Frame check: every clip has all {expected} frames of {len(chunks)} chunk(s)")
 
 
 def _probe(mp4):
@@ -175,6 +218,10 @@ def build_max_projection(chunks: List[str], n_frames: int = N_PROJECTION_FRAMES,
     total_dur = cumulative
     if total_dur <= 0:
         raise RuntimeError("Could not determine video duration")
+    if total_dur < SHORT_RECORDING_S:
+        # Short clip: flies barely move, so sample the whole clip densely.
+        start_frac = 0.0
+        n_frames = max(n_frames, int(total_dur / 2))
 
     W, H = chunk_info[0][1], chunk_info[0][2]
     t_start = total_dur * start_frac
@@ -204,32 +251,20 @@ def build_max_projection(chunks: List[str], n_frames: int = N_PROJECTION_FRAMES,
 # ┌─────────────────────────────────────────────────────────────────────┐
 # │  CIRCLE DETECTION on max-projection                                 │
 # └─────────────────────────────────────────────────────────────────────┘
-def detect_arenas(frame, n_expected=DEFAULT_N_ARENAS, min_r=0, max_r=0):
-    """Hough circle detection on (ideally max-projected) frame."""
-    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY) if len(frame.shape) == 3 else frame
-    fh, fw = gray.shape[:2]
-    if min_r == 0: min_r = int(min(fh, fw) * 0.04)
-    if max_r == 0: max_r = int(min(fh, fw) * 0.20)
+def detect_arenas(frame, n_expected=DEFAULT_N_ARENAS, min_r=0, max_r=0,
+                  roi=None, polarity="auto"):
+    """Detect arenas on a (max-projected) frame.
 
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    blurred = cv2.GaussianBlur(clahe.apply(gray), (9, 9), 2)
-
-    best = None
-    for p2 in range(80, 8, -3):
-        circles = cv2.HoughCircles(
-            blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=min_r * 2,
-            param1=100, param2=p2, minRadius=min_r, maxRadius=max_r,
-        )
-        if circles is not None:
-            if best is None or circles.shape[1] > best.shape[1]:
-                best = circles
-            if circles.shape[1] >= n_expected:
-                break
-
-    arenas = []
-    if best is not None:
-        for c in best[0]:
-            arenas.append(Arena(cx=float(c[0]), cy=float(c[1]), r=float(c[2])))
+    Thin wrapper around :func:`thermokourt.extract.arena_detect.detect_arenas`
+    (blob + Hough seeds, template ranking) that returns sorted ``Arena``
+    objects. ``roi`` is ``(x, y, w, h)`` in frame pixels; ``polarity`` is
+    ``'bright'``, ``'dark'`` or ``'auto'``.
+    """
+    circles = arena_detect.detect_arenas(
+        frame, n_expected=n_expected, min_r=min_r, max_r=max_r,
+        roi=roi, polarity=polarity,
+    )
+    arenas = [Arena(cx=c.cx, cy=c.cy, r=c.r) for c in circles]
     return filter_by_radius(sort_arenas_row_major(arenas))
 
 
@@ -360,7 +395,8 @@ class ArenaEditorCV2:
             cv2.circle(vis, (cx, cy), r, col, line_w)
 
             # Bounding box (padded crop)
-            bx, by, bw, bh = a.bbox(padding=CROP_PADDING, frame_w=fw, frame_h=fh)
+            bx, by, bw, bh = a.bbox(padding=CROP_PADDING, frame_w=fw, frame_h=fh,
+                                    min_size=MIN_CLIP_SIZE)
             cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), col, thin_w)
 
             # Corner mask preview — diagonal lines in each corner of the bbox
@@ -570,6 +606,42 @@ class ArenaEditorCV2:
 # ┌─────────────────────────────────────────────────────────────────────┐
 # │  FFMPEG CONCAT + CROP + CORNER MASK                                 │
 # └─────────────────────────────────────────────────────────────────────┘
+def recorded_fps(recording_dir):
+    """Real frame rate of a Motif recording.
+
+    Motif can label the mp4 with a different rate than the camera ran at (11 Nov
+    2026: camera 69 fps, file says 25, so clips played 2.76x slow). The frame
+    timestamps (``NNNNNN.npz``) give the real rate; when that is within 1 % of the
+    camera's set ``acquisitionframerate`` the set value is used, since timestamp
+    jitter (69.001) gives frame rates MPEG-4 cannot store (time base 1000/69001).
+    Returns None when neither source is available."""
+    rec = Path(recording_dir)
+    measured = None
+    for npz in sorted(rec.glob("[0-9]" * 6 + ".npz")):
+        try:
+            with np.load(npz, allow_pickle=True) as z:
+                t = np.asarray(z["frame_time"], dtype=float)
+            if t.size > 10 and np.median(np.diff(t)) > 0:
+                measured = 1.0 / float(np.median(np.diff(t)))
+                break
+        except Exception:  # noqa: BLE001 - fall back to metadata
+            pass
+    nominal = None
+    meta = rec / "metadata.yaml"
+    if meta.is_file():
+        import yaml
+
+        nominal = (yaml.safe_load(meta.read_text(encoding="utf-8")) or {}).get(
+            "acquisitionframerate"
+        )
+        nominal = float(nominal) if nominal else None
+    if measured and nominal and abs(measured / nominal - 1) <= 0.01:
+        return nominal
+    if measured:
+        return round(measured, 2)
+    return nominal
+
+
 def build_concat_file(chunks, tmpdir):
     p = os.path.join(tmpdir, "concat.txt")
     with open(p, "w") as f:
@@ -612,6 +684,7 @@ def _extract_single_arena(args_dict):
         padding=d.get("padding", CROP_PADDING),
         frame_w=d["frame_width"],
         frame_h=d["frame_height"],
+        min_size=d.get("min_size", 0),
     )
 
     out_path = os.path.join(
@@ -624,10 +697,13 @@ def _extract_single_arena(args_dict):
         if sz > 1024:  # > 1 KB = probably a valid file
             sz_str = f"{sz / 1e6:.1f} MB" if sz < 1e9 else f"{sz / 1e9:.1f} GB"
             print(f"  [{idx+1}/{n}] #{arena.idx:02d}  SKIP (exists, {sz_str})")
+            emit_progress(arena.idx, n, "done", 1.0)
             return out_path
 
     tag = f"[{idx+1}/{n}] #{arena.idx:02d}"
     print(f"  {tag}  crop={w}x{h}+{x}+{y} (r={arena.r:.0f})")
+    # "-r" before the input: re-time every frame at the real camera rate, no drops
+    rate = ["-r", f"{d['fps']:g}"] if d.get("fps") else []
 
     t0 = time.monotonic()
 
@@ -635,27 +711,30 @@ def _extract_single_arena(args_dict):
         # Crop to temp, then apply corner mask
         out_tmp = out_path + ".tmp.mp4"
         rc = _run_ffmpeg_quiet(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
+            ["ffmpeg", "-y", *rate, "-f", "concat", "-safe", "0", "-i", concat_file,
              "-vf", f"crop={w}:{h}:{x}:{y}",
              "-c:v", codec, "-crf", str(crf), "-preset", "fast",
              "-pix_fmt", "yuv420p", "-an", out_tmp],
-            total_frames, tag=f"    {tag} crop"
+            total_frames, tag=f"    {tag} crop",
+            progress=_phase_progress(arena.idx, n, "crop", 0.0, 0.5),
         )
         if rc != 0:
             print(f"    {tag} WARNING: ffmpeg crop failed")
             return None
-        _postprocess_corner_mask(out_tmp, out_path, w, h, corner_frac, tag=tag)
+        _postprocess_corner_mask(out_tmp, out_path, w, h, corner_frac, tag=tag,
+                                 progress=_phase_progress(arena.idx, n, "mask", 0.5, 0.5))
         try:
             os.remove(out_tmp)
         except OSError:
             pass
     else:
         rc = _run_ffmpeg_quiet(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
+            ["ffmpeg", "-y", *rate, "-f", "concat", "-safe", "0", "-i", concat_file,
              "-vf", f"crop={w}:{h}:{x}:{y}",
              "-c:v", codec, "-crf", str(crf), "-preset", "fast",
              "-pix_fmt", "yuv420p", "-an", out_path],
-            total_frames, tag=f"    {tag} crop"
+            total_frames, tag=f"    {tag} crop",
+            progress=_phase_progress(arena.idx, n, "crop", 0.0, 1.0),
         )
         if rc != 0:
             print(f"    {tag} WARNING: ffmpeg failed")
@@ -666,11 +745,30 @@ def _extract_single_arena(args_dict):
         sz = os.path.getsize(out_path)
         sz_str = f"{sz / 1e6:.1f} MB" if sz < 1e9 else f"{sz / 1e9:.1f} GB"
         print(f"    {tag} done in {elapsed:.0f}s -> {sz_str}")
+        emit_progress(arena.idx, n, "done", 1.0)
 
     return out_path
 
 
-def _run_ffmpeg_quiet(cmd, total_frames, tag=""):
+PROGRESS_EVERY_S = 2.0
+
+
+def emit_progress(arena_idx, n_arenas, phase, frac):
+    """Machine-readable progress line for GUIs (``@progress`` protocol):
+    ``@progress arena=NN of=N phase=crop|mask|done frac=0.000``, where ``frac`` is
+    this arena's share done (crop and corner mask together)."""
+    print(f"@progress arena={arena_idx:02d} of={n_arenas} phase={phase} "
+          f"frac={min(1.0, max(0.0, frac)):.3f}", flush=True)
+
+
+def _phase_progress(arena_idx, n_arenas, phase, start, weight):
+    """Callback (done, total) → progress line for one phase of one arena."""
+    def report(done, total):
+        emit_progress(arena_idx, n_arenas, phase, start + weight * (done / total if total else 0))
+    return report
+
+
+def _run_ffmpeg_quiet(cmd, total_frames, tag="", progress=None):
     """Run ffmpeg with periodic progress to stdout. Returns returncode."""
     import time
     proc = subprocess.Popen(
@@ -690,15 +788,18 @@ def _run_ffmpeg_quiet(cmd, total_frames, tag=""):
             except ValueError:
                 pass
             now = time.monotonic()
-            if total_frames > 0 and now - last_print >= 5.0:
-                pct = min(100, frame_count * 100 // total_frames)
-                print(f"    {tag} {pct}%", flush=True)
+            if total_frames > 0 and now - last_print >= PROGRESS_EVERY_S:
+                if progress:
+                    progress(frame_count, total_frames)
+                else:
+                    pct = min(100, frame_count * 100 // total_frames)
+                    print(f"    {tag} {pct}%", flush=True)
                 last_print = now
     proc.wait()
     return proc.returncode
 
 
-def _postprocess_corner_mask(in_path, out_path, crop_w, crop_h, frac, tag=""):
+def _postprocess_corner_mask(in_path, out_path, crop_w, crop_h, frac, tag="", progress=None):
     """Read video, white-out corners frame by frame, re-encode."""
     import time
     cap = cv2.VideoCapture(in_path)
@@ -706,6 +807,9 @@ def _postprocess_corner_mask(in_path, out_path, crop_w, crop_h, frac, tag=""):
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, fps, (crop_w, crop_h))
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError(f"cannot write {out_path} at {fps:g} fps (OpenCV/MPEG-4 refused it)")
     triangles = corner_mask_triangles(crop_w, crop_h, frac)
     count = 0
     last_print = time.monotonic()
@@ -718,9 +822,11 @@ def _postprocess_corner_mask(in_path, out_path, crop_w, crop_h, frac, tag=""):
         writer.write(frame)
         count += 1
         now = time.monotonic()
-        if total > 0 and now - last_print >= 5.0:
-            pct = count * 100 // total
-            print(f"    {tag} mask {pct}%", flush=True)
+        if total > 0 and now - last_print >= PROGRESS_EVERY_S:
+            if progress:
+                progress(count, total)
+            else:
+                print(f"    {tag} mask {count * 100 // total}%", flush=True)
             last_print = now
     cap.release()
     writer.release()
@@ -728,7 +834,7 @@ def _postprocess_corner_mask(in_path, out_path, crop_w, crop_h, frac, tag=""):
 
 def concat_and_crop(chunks, arenas, output_dir, recording_name,
                     codec="libx264", crf=18, frame_height=0, frame_width=0,
-                    keep_full=False, corner_frac=CORNER_MASK, jobs=1):
+                    keep_full=False, corner_frac=CORNER_MASK, jobs=1, fps=None):
     """Concatenate mp4 chunks and crop each arena, with resume + parallelism."""
     import time
     from multiprocessing import Pool
@@ -768,9 +874,11 @@ def concat_and_crop(chunks, arenas, output_dir, recording_name,
                 "frame_height": frame_height,
                 "corner_frac": corner_frac,
                 "padding": CROP_PADDING,
+                "min_size": MIN_CLIP_SIZE,
                 "total_frames": total_frames,
                 "arena_index": i,
                 "n_arenas": len(arenas),
+                "fps": fps,
             })
 
         t0 = time.monotonic()
@@ -816,6 +924,19 @@ def _die(msg):
     sys.exit(1)
 
 
+def save_arena_preview(frame, arenas, path, scale=0.4):
+    """Write a downscaled PNG with numbered arena circles drawn on it."""
+    img = frame if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    for a in arenas:
+        col = COLOURS_BGR[a.idx % len(COLOURS_BGR)]
+        cv2.circle(img, (int(a.cx), int(a.cy)), int(a.r), col, 6)
+        cv2.putText(img, str(a.idx), (int(a.cx) - 20, int(a.cy) + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.5, col, 6)
+    small = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    cv2.imwrite(path, small)
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         prog="arena_extractor",
@@ -829,18 +950,127 @@ def parse_args():
     p.add_argument("--crf", type=int, default=18)
     p.add_argument("--codec", default="libx264")
     p.add_argument("--padding", type=float, default=CROP_PADDING)
+    p.add_argument("--min_size", type=int, default=MIN_CLIP_SIZE,
+                   help="Grow every clip to at least this many px a side (e.g. 224 for a "
+                        "SLEAP model with 224 px instance crops).")
     p.add_argument("--corner_mask", type=float, default=CORNER_MASK,
                    help=f"Corner triangle size as fraction of crop side (default: {CORNER_MASK}).")
     p.add_argument("--no_corner_mask", action="store_true",
                    help="Disable corner white-out.")
     p.add_argument("--keep_full", action="store_true")
+    p.add_argument("--fps", type=float, default=None,
+                   help="Frame rate to label the clips with (default: the real camera rate "
+                        "from the Motif timestamps; 0 = keep the mp4's own label).")
     p.add_argument("--no_gui", action="store_true")
     p.add_argument("-j", "--jobs", type=int, default=1,
                    help="Parallel workers for extraction (default: 1). "
                         "2-3 recommended for USB drives, more for SSDs.")
     p.add_argument("--n_proj_frames", type=int, default=N_PROJECTION_FRAMES,
                    help=f"Frames for max-projection (default: {N_PROJECTION_FRAMES}).")
+    p.add_argument("--min_r", type=int, default=0,
+                   help="Smallest arena radius in pixels (default: 3%% of short side).")
+    p.add_argument("--max_r", type=int, default=0,
+                   help="Largest arena radius in pixels (default: 20%% of short side).")
+    p.add_argument("--roi", default=None, metavar="X,Y,W,H",
+                   help="Restrict detection to this rectangle (pixels), e.g. the arena "
+                        "plate. Use it when lamps, lids or screws are in view.")
+    p.add_argument("--polarity", choices=["auto", "bright", "dark"], default="auto",
+                   help="Arenas brighter or darker than the plate (default: auto).")
+    p.add_argument("--detect_only", action="store_true",
+                   help="Detect (and verify in the GUI), save the arenas JSON and a "
+                        "preview PNG, then stop without extracting video.")
     return p.parse_args()
+
+
+def reduced_offset(arenas_path, recording_dir, video_w, video_h):
+    """Offset (x, y) of a recording cropped by Rig Conductor (reduced.json) when a
+    full-frame layout is applied to it, else None."""
+    red = Path(recording_dir) / "reduced.json"
+    if not red.is_file():
+        return None
+    r = json.loads(red.read_text(encoding="utf-8"))
+    d = json.loads(Path(arenas_path).read_text(encoding="utf-8"))
+    full_w = d.get("frame_width") if isinstance(d, dict) else None
+    if (video_w, video_h) != (r["w"], r["h"]) or (full_w and full_w != r["full_width"]):
+        return None
+    return int(r["x"]), int(r["y"]), int(r["full_width"]), int(r["full_height"])
+
+
+def video_crop(recording_dir, video_w, video_h):
+    """Rig Conductor's crop of this recording's video (reduced.json) as
+    {x, y, w, h, full_width, full_height}, or None for an uncropped video."""
+    red = Path(recording_dir) / "reduced.json"
+    if not red.is_file():
+        return None
+    r = json.loads(red.read_text(encoding="utf-8"))
+    if (video_w, video_h) != (r["w"], r["h"]):
+        return None
+    keys = ("x", "y", "w", "h", "full_width", "full_height")
+    return {k: int(r[k]) for k in keys}
+
+
+def clip_boxes(arenas, frame_w, frame_h, offset=(0, 0)):
+    """The exact box each clip is cut with, in full camera pixels:
+    {idx: [x, y, w, h]}. Clip pixel (u, v) is camera pixel (u + x, v + y)."""
+    ox, oy = offset
+    out = {}
+    for a in arenas:
+        x, y, w, h = a.bbox(padding=CROP_PADDING, frame_w=frame_w, frame_h=frame_h,
+                            min_size=MIN_CLIP_SIZE)
+        out[a.idx] = [x + ox, y + oy, w, h]
+    return out
+
+
+def clip_to_camera(points, arenas_json, idx):
+    """Points (..., 2) in clip pixels of arena ``idx`` → full camera pixels,
+    using the clip box saved in the arenas JSON."""
+    d = json.loads(Path(arenas_json).read_text(encoding="utf-8"))
+    entry = next(a for a in d["arenas"] if a.get("idx") == idx)
+    if "clip" not in entry:
+        raise ValueError(f"{arenas_json}: arena {idx} has no saved clip box (cut before v1.3)")
+    x, y = entry["clip"][:2]
+    return np.asarray(points, dtype=float) + (x, y)
+
+
+def layout_record(recording_name, arenas, frame_w, frame_h, recording_dir):
+    """The arenas JSON for clips cut from a ``frame_w`` × ``frame_h`` video.
+
+    Positions are saved in full camera coordinates even for a cropped recording,
+    so layouts, the database and re-cuts all share one coordinate system. The
+    crop of the video and the exact box of every clip are kept too: together
+    they map poses in a clip back onto the original camera frame.
+    """
+    crop = video_crop(recording_dir, frame_w, frame_h)
+    saved, full_w, full_h, extra = arenas, frame_w, frame_h, {}
+    if crop:
+        ox, oy, full_w, full_h = crop["x"], crop["y"], crop["full_width"], crop["full_height"]
+        saved = shift_arenas(arenas, ox, oy)
+        extra = {"video_offset": [ox, oy], "video_crop": crop}
+    boxes = clip_boxes(arenas, frame_w, frame_h, extra.get("video_offset", (0, 0)))
+    return {
+        "recording": recording_name,
+        "frame_width": full_w, "frame_height": full_h,
+        "padding": CROP_PADDING, "corner_mask": CORNER_MASK,
+        "min_size": MIN_CLIP_SIZE,
+        "clip_box": "x, y, w, h in camera px; clip (u, v) = camera (u + x, v + y)",
+        **extra,
+        "arenas": [{**a.to_dict(), "clip": boxes[a.idx]} for a in saved],
+    }
+
+
+def shift_arenas(arenas, dx, dy):
+    """Copies of ``arenas`` moved by (dx, dy), indices kept."""
+    return [Arena(cx=a.cx + dx, cy=a.cy + dy, r=a.r, idx=a.idx) for a in arenas]
+
+
+def shift_for_reduced(arenas, arenas_path, recording_dir, video_w, video_h):
+    """A recording cropped by Rig Conductor ('reduce', reduced.json) has its arenas
+    at (cx - x, cy - y). Shift a full-frame layout so re-cutting still works."""
+    off = reduced_offset(arenas_path, recording_dir, video_w, video_h)
+    if off is None:
+        return arenas
+    print(f"  Reduced recording: arenas shifted by ({-off[0]}, {-off[1]})")
+    return shift_arenas(arenas, -off[0], -off[1])
 
 
 def load_arenas_json(path):
@@ -854,8 +1084,9 @@ def load_arenas_json(path):
 
 def main():
     args = parse_args()
-    global CROP_PADDING, CORNER_MASK
+    global CROP_PADDING, CORNER_MASK, MIN_CLIP_SIZE
     CROP_PADDING = args.padding
+    MIN_CLIP_SIZE = args.min_size
     if args.no_corner_mask:
         CORNER_MASK = 0.0
     else:
@@ -866,7 +1097,7 @@ def main():
     output_dir = args.output_dir or recording_dir
 
     print("+" + "-" * 44 + "+")
-    print("|  ARENA EXTRACTOR v1.2                      |")
+    print("|  ARENA EXTRACTOR v1.3                      |")
     print("|  detect. adjust. stitch. crop.             |")
     print("+" + "-" * 44 + "+")
 
@@ -880,6 +1111,7 @@ def main():
         print(f"  Loaded {len(arenas)} arenas from {args.arenas}")
         # Still need a frame for display
         w, h, dur, fps = _probe(chunks[0])
+        arenas = shift_for_reduced(arenas, args.arenas, recording_dir, w, h)
         proj = extract_frame_at(chunks[-1], dur * 0.9 if dur > 0 else 0, w, h)
         if proj is None:
             proj = extract_frame_at(chunks[0], 0, w, h)
@@ -890,9 +1122,12 @@ def main():
         frame_h, frame_w = proj.shape[:2]
 
         print(f"  Frame size: {frame_w} x {frame_h}")
-        print(f"  Running Hough detection on max-projection...")
-        arenas = detect_arenas(proj, n_expected=args.n_arenas)
-        print(f"  Detected {len(arenas)} arenas")
+        print("  Detecting arenas on max-projection...")
+        roi = arena_detect.parse_roi(args.roi, frame_h, frame_w) if args.roi else None
+        arenas = detect_arenas(proj, n_expected=args.n_arenas, min_r=args.min_r,
+                               max_r=args.max_r, roi=roi, polarity=args.polarity)
+        print(f"  Detected {len(arenas)} arenas"
+              + ("" if len(arenas) == args.n_arenas else f" (expected {args.n_arenas})"))
 
         if not args.no_gui:
             json_path = os.path.join(output_dir, f"{recording_name}_arenas.json")
@@ -919,15 +1154,21 @@ def main():
     except PermissionError:
         _die(f"Cannot create output directory '{output_dir}' — permission denied.\n"
              f"       Try a path you own, e.g.  -o ~/results/")
-    with open(json_out, "w") as f:
-        json.dump({
-            "recording": recording_name,
-            "frame_width": frame_w, "frame_height": frame_h,
-            "padding": CROP_PADDING, "corner_mask": CORNER_MASK,
-            "arenas": [a.to_dict() for a in arenas],
-        }, f, indent=2)
+    with open(json_out, "w", encoding="utf-8") as f:
+        json.dump(layout_record(recording_name, arenas, frame_w, frame_h, recording_dir),
+                  f, indent=2)
     print(f"\n  Arena positions saved -> {json_out}")
+    preview = os.path.join(output_dir, f"{recording_name}_arenas.png")
+    save_arena_preview(proj, arenas, preview)
+    print(f"  Preview image      -> {preview}")
+    if args.detect_only:
+        return
 
+    clip_fps = args.fps if args.fps is not None else recorded_fps(recording_dir)
+    if clip_fps:
+        _, _, _, file_fps = _probe(chunks[0])
+        note = "" if abs(file_fps - clip_fps) < 0.5 else f" (mp4 says {file_fps:g}: re-timed)"
+        print(f"  Frame rate: {clip_fps:g} fps{note}")
     print(f"\n  Extracting ({len(arenas)} arenas x {len(chunks)} chunks, "
           f"{args.jobs} worker{'s' if args.jobs > 1 else ''})...")
     outputs = concat_and_crop(
@@ -935,7 +1176,10 @@ def main():
         recording_name=recording_name, codec=args.codec, crf=args.crf,
         frame_height=frame_h, frame_width=frame_w,
         keep_full=args.keep_full, corner_frac=CORNER_MASK, jobs=args.jobs,
+        fps=clip_fps,
     )
+    clips = [o for o in outputs if not o.endswith("_full.mp4")]
+    check_clip_frames(clips, chunks)
     print(f"\n  Done! {len(outputs)} files written to {output_dir}")
     for p in outputs:
         print(f"    -> {os.path.basename(p)}")

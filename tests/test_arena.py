@@ -1,7 +1,6 @@
 """Basic tests for ThermoKourt arena extraction."""
 
 import json
-import pytest
 
 from thermokourt.extract.arena_extractor import (
     Arena,
@@ -68,3 +67,129 @@ class TestSortArenas:
 
     def test_empty(self):
         assert sort_arenas_row_major([]) == []
+
+
+def test_bbox_min_size_grows_small_arenas_centred():
+    from thermokourt.extract.arena_extractor import Arena
+
+    a = Arena(cx=1254.5, cy=1147.25, r=93.3, idx=3)
+    x, y, w, h = a.bbox(padding=0.1, frame_w=2600, frame_h=2160)
+    assert w < 224  # the 11 Nov problem: 204 px clip
+    x, y, w, h = a.bbox(padding=0.1, frame_w=2600, frame_h=2160, min_size=224)
+    assert w >= 224 and h >= 224 and w % 2 == 0
+    assert abs((x + w / 2) - a.cx) <= 1.5 and abs((y + h / 2) - a.cy) <= 1.5
+    big = Arena(cx=500, cy=500, r=150)
+    assert big.bbox(0.1, 2600, 2160, min_size=224) == big.bbox(0.1, 2600, 2160)
+
+
+def test_shift_for_reduced(tmp_path):
+    from thermokourt.extract.arena_extractor import Arena, shift_for_reduced
+
+    lay = tmp_path / "arenas.json"
+    lay.write_text(json.dumps({"frame_width": 2600, "frame_height": 2160,
+                               "arenas": [{"cx": 1000, "cy": 900, "r": 100, "idx": 0}]}))
+    arenas = [Arena(cx=1000, cy=900, r=100, idx=0)]
+    assert shift_for_reduced(arenas, str(lay), str(tmp_path), 944, 976) == arenas  # not reduced
+    (tmp_path / "reduced.json").write_text(json.dumps(
+        {"x": 784, "y": 830, "w": 944, "h": 976, "full_width": 2600, "full_height": 2160}))
+    (a,) = shift_for_reduced(arenas, str(lay), str(tmp_path), 944, 976)
+    assert (a.cx, a.cy, a.r) == (216, 70, 100)
+    # video still full-frame (crop not applied yet): no shift
+    assert shift_for_reduced(arenas, str(lay), str(tmp_path), 2600, 2160) == arenas
+
+
+def test_reduced_offset_and_shift(tmp_path):
+    import json
+
+    from thermokourt.extract.arena_extractor import Arena, reduced_offset, shift_arenas
+
+    lay = tmp_path / "arenas.json"
+    lay.write_text(json.dumps({"frame_width": 2600, "arenas": []}), encoding="utf-8")
+    assert reduced_offset(lay, tmp_path, 944, 976) is None
+    (tmp_path / "reduced.json").write_text(json.dumps(
+        {"x": 784, "y": 830, "w": 944, "h": 976, "full_width": 2600, "full_height": 2160}),
+        encoding="utf-8")
+    assert reduced_offset(lay, tmp_path, 944, 976) == (784, 830, 2600, 2160)
+    (a,) = shift_arenas([Arena(cx=10, cy=20, r=5, idx=3)], 784, 830)
+    assert (a.cx, a.cy, a.r, a.idx) == (794, 850, 5, 3)
+
+
+def _tiny_mp4(path, frames):
+    import subprocess
+
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=25",
+         "-frames:v", str(frames), "-pix_fmt", "yuv420p", "-c:v", "libx264", str(path)],
+        check=True,
+    )
+
+
+def test_chunks_are_motif_names_only(tmp_path):
+    from thermokourt.extract.arena_extractor import get_mp4_chunks
+
+    for name in ("000001.mp4", "000000.mp4", "000000.reduced.mp4", "export.mp4"):
+        (tmp_path / name).write_bytes(b"x")
+    assert [p.split("/")[-1] for p in get_mp4_chunks(tmp_path)] == ["000000.mp4", "000001.mp4"]
+    other = tmp_path / "plain"
+    other.mkdir()
+    (other / "clip.mp4").write_bytes(b"x")
+    assert get_mp4_chunks(other)[0].endswith("clip.mp4")
+
+
+def test_clip_frame_check(tmp_path):
+    import shutil
+
+    import pytest
+
+    from thermokourt.extract.arena_extractor import check_clip_frames
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg missing")
+    chunks = [tmp_path / "000000.mp4", tmp_path / "000001.mp4"]
+    for c in chunks:
+        _tiny_mp4(c, 10)
+    good, short = tmp_path / "good.mp4", tmp_path / "short.mp4"
+    _tiny_mp4(good, 20)
+    _tiny_mp4(short, 12)
+    check_clip_frames([str(good)], [str(c) for c in chunks])
+    with pytest.raises(RuntimeError, match="short.mp4 has 12"):
+        check_clip_frames([str(good), str(short)], [str(c) for c in chunks])
+
+
+def test_clip_boxes_map_clip_pixels_back_to_the_camera(tmp_path):
+    """Full frame → Conductor crop (reduced.json) → arena clip → back again."""
+    import numpy as np
+
+    from thermokourt.extract.arena_extractor import Arena, clip_to_camera, layout_record
+
+    full = np.zeros((2160, 2600), np.uint8)
+    full[1000, 1500] = 255                       # one marked pixel in the camera frame
+    x, y, w, h = 784, 830, 944, 976
+    (tmp_path / "reduced.json").write_text(json.dumps(
+        {"x": x, "y": y, "w": w, "h": h, "full_width": 2600, "full_height": 2160}))
+    video = full[y:y + h, x:x + w]               # the reduced recording
+    arena = Arena(cx=1500 - x + 3.4, cy=1000 - y - 7.8, r=151.3, idx=4)
+    bx, by, bw, bh = arena.bbox(padding=0.1, frame_w=w, frame_h=h)
+    clip = video[by:by + bh, bx:bx + bw]          # what ffmpeg crop=bw:bh:bx:by cuts
+    v, u = np.argwhere(clip == 255)[0]
+
+    rec = layout_record("r", [arena], w, h, tmp_path)
+    assert rec["video_crop"]["x"] == x and rec["frame_width"] == 2600
+    (entry,) = rec["arenas"]
+    assert entry["clip"][2:] == [bw, bh]
+    lay = tmp_path / "r_arenas.json"
+    lay.write_text(json.dumps(rec))
+    assert clip_to_camera([u, v], lay, 4).tolist() == [1500, 1000]
+
+
+def test_uncropped_video_has_no_crop_and_old_layouts_say_so(tmp_path):
+    from thermokourt.extract.arena_extractor import Arena, clip_to_camera, layout_record
+
+    rec = layout_record("r", [Arena(cx=500, cy=400, r=150, idx=0)], 2600, 2160, tmp_path)
+    assert "video_crop" not in rec and rec["arenas"][0]["clip"][:2] == [335, 235]
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"arenas": [{"cx": 500, "cy": 400, "r": 150, "idx": 0}]}))
+    import pytest
+
+    with pytest.raises(ValueError, match="no saved clip box"):
+        clip_to_camera([0, 0], old, 0)
