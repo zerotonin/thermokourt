@@ -1,5 +1,13 @@
 # ThermoKourt
 
+[![tests](https://github.com/zerotonin/thermokourt/actions/workflows/tests.yml/badge.svg)](https://github.com/zerotonin/thermokourt/actions/workflows/tests.yml)
+[![docs](https://github.com/zerotonin/thermokourt/actions/workflows/docs.yml/badge.svg)](https://zerotonin.github.io/thermokourt/)
+[![release](https://github.com/zerotonin/thermokourt/actions/workflows/release.yml/badge.svg)](https://github.com/zerotonin/thermokourt/releases)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org/)
+[![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.PENDING.svg)](https://zenodo.org/)
+
 **A modular pipeline for analysing *Drosophila* courtship and aggression under thermal manipulation.**
 
 ThermoKourt is a toolbox for behavioural neuroscientists studying how temperature modulates social behaviour in *Drosophila melanogaster*. It covers the full arc from raw multi-arena recordings to publication-ready ethograms and automated behavioural classifiers.
